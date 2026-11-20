@@ -1,0 +1,12 @@
+[package]
+name = "nosco-crf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust Wapiti-compatible linear-chain CRF engine with compact binary model format"
+
+[dependencies]
+flate2.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
+xxhash-rust.workspace = true

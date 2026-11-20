@@ -1,0 +1,13 @@
+[package]
+name = "nosco-pdf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust PDF parser, font/CMap decoder, and academic layout analyzer"
+
+[dependencies]
+flate2.workspace = true
+lopdf.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true

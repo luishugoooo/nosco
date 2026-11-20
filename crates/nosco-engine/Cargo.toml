@@ -1,0 +1,16 @@
+[package]
+name = "nosco-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Full scholarly PDF and bibliographic parsing cascade engine"
+
+[dependencies]
+nosco-crf.workspace = true
+nosco-features.workspace = true
+nosco-lexicon.workspace = true
+nosco-models.workspace = true
+nosco-pdf.workspace = true
+rayon.workspace = true
+regex.workspace = true
+thiserror.workspace = true

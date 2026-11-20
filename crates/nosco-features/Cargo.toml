@@ -1,0 +1,12 @@
+[package]
+name = "nosco-features"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Exact GROBID feature extractors for all 11 scholarly document CRF models"
+
+[dependencies]
+nosco-lexicon.workspace = true
+nosco-pdf.workspace = true
+regex.workspace = true
+thiserror.workspace = true

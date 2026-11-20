@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/nosco-crf",
+    "crates/nosco-lexicon",
+    "crates/nosco-pdf",
+    "crates/nosco-models",
+    "crates/nosco-features",
+    "crates/nosco-engine",
+    "crates/nosco-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["nosco contributors"]
+
+[workspace.dependencies]
+nosco-crf = { path = "crates/nosco-crf" }
+nosco-lexicon = { path = "crates/nosco-lexicon" }
+nosco-pdf = { path = "crates/nosco-pdf" }
+nosco-models = { path = "crates/nosco-models" }
+nosco-features = { path = "crates/nosco-features" }
+nosco-engine = { path = "crates/nosco-engine" }
+
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+flate2 = "1.1"
+lopdf = "0.47"
+memmap2 = "0.9"
+quick-xml = "0.42"
+rayon = "1.12"
+regex = "1.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+unicode-normalization = "0.1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3

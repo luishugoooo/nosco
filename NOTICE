@@ -1,0 +1,156 @@
+nosco
+Copyright 2026 nosco contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+nosco is an independent pure-Rust scholarly document extraction engine
+compatible with GROBID 0.9.1 CRF models and lexicons. It is not officially
+affiliated with, sponsored by, or endorsed by the GROBID project.
+
+========================================================================
+Upstream Design & Compatibility Attributions
+========================================================================
+
+- GROBID (https://github.com/grobidOrg/grobid)
+  Copyright Patrice Lopez and contributors.
+  Licensed under the Apache License, Version 2.0.
+  nosco ports GROBID's CRF feature extractors, document segmentation
+  cascade, and TEI P5 output conventions to pure Rust, and reads
+  pre-trained models and lexicons from an upstream grobid-home directory.
+
+- Wapiti (https://github.com/Jekub/Wapiti)
+  Copyright Thomas Lavergne.
+  Licensed under the BSD 2-Clause License.
+  nosco-crf implements a pure-Rust linear-chain CRF decoder compatible
+  with Wapiti's model format and Viterbi/forward-backward math.
+
+========================================================================
+Third-Party Data Files Bundled in crates/nosco-pdf/data/
+========================================================================
+
+1. Adobe Glyph List & Zapf Dingbats Glyph List
+   Files: crates/nosco-pdf/data/glyphlist.txt
+          crates/nosco-pdf/data/zapfdingbats.txt
+
+-----------------------------------------------------------
+Copyright 2002-2019 Adobe (http://www.adobe.com/).
+
+Redistribution and use in source and binary forms, with or
+without modification, are permitted provided that the
+following conditions are met:
+
+Redistributions of source code must retain the above
+copyright notice, this list of conditions and the following
+disclaimer.
+
+Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following
+disclaimer in the documentation and/or other materials
+provided with the distribution.
+
+Neither the name of Adobe nor the names of its contributors
+may be used to endorse or promote products derived from this
+software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+-----------------------------------------------------------
+Name:          Adobe Glyph List
+Table version: 2.0
+Date:          September 20, 2002
+URL:           https://github.com/adobe-type-tools/agl-aglfn
+
+Format: two semicolon-delimited fields:
+  (1) glyph name--upper/lowercase letters and digits
+  (2) Unicode scalar value--four uppercase hexadecimal digits
+
+------------------------------------------------------------------------
+
+2. Adobe Font Metrics (AFM) for PDF Core 14 Fonts
+   File: crates/nosco-pdf/data/standard-font-metrics.txt
+
+Adobe Font Metrics (AFM) for PDF Core 14 Fonts
+
+   This file and the 14 PostScript(R) AFM files it accompanies may be used,
+   copied, and distributed for any purpose and without charge, with or without
+   modification, provided that all copyright notices are retained; that the
+   AFM files are not distributed without this file; that all modifications
+   to this file or any of the AFM files are prominently noted in the modified
+   file(s); and that this paragraph is not modified. Adobe Systems has no
+   responsibility or obligation to support the use of the AFM files.
+Advance widths and vertical metrics from Adobe AFM files distributed with Apache PDFBox.
+https://github.com/apache/pdfbox/tree/trunk/pdfbox/src/main/resources/org/apache/pdfbox/resources/afm
+Modified from the original 14 Adobe AFM files by extracting font ascender/descender metrics,
+glyph advance widths, and standard encoding codes into this combined lookup table.
+Copyright (c) 1985, 1987, 1989, 1990, 1993, 1997 Adobe Systems Incorporated.  All Rights Reserved.
+
+------------------------------------------------------------------------
+
+3. CFF Standard Strings & Predefined Charsets (from read-fonts)
+   File: crates/nosco-pdf/data/cff-strings.txt
+
+CFF standard SIDs and predefined charsets from read-fonts 0.43.3.
+Copyright (c) 2019 Fontations Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
+
+4. PDF Standard Font Encoding Tables (from lopdf)
+   File: crates/nosco-pdf/data/encodings.txt
+
+Encoding glyph names from lopdf 0.47.0, used under the MIT license.
+MIT License
+
+Copyright (c) 2016 Junfeng Liu
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

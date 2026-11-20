@@ -1,0 +1,12 @@
+[package]
+name = "nosco-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Structured scholarly document types with JSON and TEI XML serialization"
+
+[dependencies]
+quick-xml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
