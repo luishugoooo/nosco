@@ -1,5 +1,7 @@
 use std::ops::Range;
 
+use crate::text::{joins_split_ligature, repair_pdf_ligature_glyph};
+
 use nosco_lexicon::Lexicon;
 use nosco_models::BBox;
 use nosco_pdf::{BoundingBox, LayoutDocument, LayoutToken};
@@ -49,7 +51,7 @@ pub(crate) fn append(field: &mut Option<String>, text: &str) {
 }
 
 pub(crate) fn layout_visible(token: &LayoutToken) -> bool {
-    !token.text.trim().is_empty() && !token.text.contains("@IMAGE") && !token.text.contains("@PAGE")
+    nosco_features::visible_layout_text(&token.text)
 }
 
 pub(crate) fn new_line(prev: &LayoutToken, next: &LayoutToken) -> bool {
@@ -101,36 +103,63 @@ pub(crate) fn render(
     lexicon: &Lexicon,
     keep_lines: bool,
 ) -> Rendered {
+    render_with_hyphens(doc, indices, lexicon, keep_lines, !keep_lines)
+}
+
+pub(crate) fn render_affiliation(
+    doc: &LayoutDocument,
+    indices: &[usize],
+    lexicon: &Lexicon,
+) -> String {
+    render_with_hyphens(doc, indices, lexicon, true, true).text
+}
+
+fn render_with_hyphens(
+    doc: &LayoutDocument,
+    indices: &[usize],
+    lexicon: &Lexicon,
+    keep_lines: bool,
+    join_lines: bool,
+) -> Rendered {
     let mut text = String::new();
     let mut offsets: Vec<Range<usize>> = Vec::with_capacity(indices.len());
     let mut previous = None;
     for &index in indices {
         let token = &doc.tokens[index];
-        let part = token.text.trim();
+        let raw_part = token.text.trim();
+        let part = repair_pdf_ligature_glyph(raw_part);
         if let Some(prev_index) = previous {
             let prev = &doc.tokens[prev_index];
             if new_line(prev, token) {
-                if !keep_lines
+                if join_lines
+                    && prev.page == token.page
                     && let Some(left) = text.strip_suffix(['-', '\u{ad}', '‐'])
                     && part.starts_with(char::is_alphabetic)
                 {
-                    if text.ends_with('\u{ad}') || join_hyphen(left, part, lexicon) {
+                    if text.ends_with('\u{ad}') || join_hyphen(left, &part, lexicon) {
                         text.truncate(left.len());
                         if let Some(offset) = offsets.last_mut() {
                             offset.end = text.len();
                         }
+                    } else if keep_lines {
+                        text.push('\n');
                     }
                 } else if !text.ends_with(char::is_whitespace) {
                     text.push(if keep_lines { '\n' } else { ' ' });
                 }
             } else if (prev.space_after || index > prev_index + 1)
                 && !text.ends_with(char::is_whitespace)
+                && !(index == prev_index + 1
+                    && ((raw_part.starts_with('Ɵ') && text.ends_with(char::is_alphabetic))
+                        || (prev.text.trim_end().ends_with('Ɵ')
+                            && part.starts_with(char::is_lowercase))
+                        || joins_split_ligature(&text, &part, lexicon)))
             {
                 text.push(' ');
             }
         }
         let start = text.len();
-        text.push_str(part);
+        text.push_str(&part);
         offsets.push(start..text.len());
         previous = Some(index);
     }
@@ -169,6 +198,62 @@ pub(crate) mod tests {
             subscript: false, superscript: false, color: (0, 0, 0), rotated: false,
             space_after: false, new_line_after: false, block_idx: 0, line_idx: 0,
         }
+    }
+
+    #[test]
+    fn repairs_broken_pdf_ligatures_without_merging_unrelated_words() {
+        let doc = LayoutDocument {
+            tokens: [
+                "Reconfi",
+                "guraƟ",
+                "on",
+                "Redistribu",
+                "Ɵ",
+                "on",
+                "Affl",
+                "uence",
+                "of",
+                "it",
+                "fi",
+                "nal",
+            ]
+            .into_iter()
+            .map(|text| LayoutToken {
+                space_after: true,
+                ..test_token(text)
+            })
+            .collect(),
+            ..Default::default()
+        };
+        let indices: Vec<_> = (0..doc.tokens.len()).collect();
+        let rendered = render(&doc, &indices, &Lexicon::default(), true);
+        assert_eq!(
+            rendered.text,
+            "Reconfiguration Redistribution Affluence of it fi nal"
+        );
+        assert_eq!(&rendered.text[rendered.offsets[4].clone()], "ti");
+    }
+
+    #[test]
+    fn affiliation_rejoins_only_the_wrapped_word() {
+        let mut doc = LayoutDocument {
+            tokens: vec![
+                test_token("Califor-"),
+                test_token("nia"),
+                test_token("Stanford"),
+            ],
+            ..Default::default()
+        };
+        doc.tokens[1].line_idx = 1;
+        doc.tokens[2].line_idx = 2;
+        assert_eq!(
+            render_affiliation(&doc, &[0, 1, 2], &Lexicon::default()),
+            "California\nStanford"
+        );
+        assert_eq!(
+            render(&doc, &[0, 1, 2], &Lexicon::default(), true).text,
+            "Califor-\nnia\nStanford"
+        );
     }
 
     #[test]

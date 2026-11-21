@@ -969,6 +969,8 @@ pub(crate) fn normalize(chars: impl IntoIterator<Item = char>) -> String {
     let mut text = String::new();
     for character in chars {
         match character {
+            '\0' | '\u{00ad}' | '\u{200b}' | '\u{200d}' | '\u{feff}' => {}
+
             'ﬁ' => text.push_str("fi"),
             'ﬂ' => text.push_str("fl"),
             'ﬀ' => text.push_str("ff"),
@@ -1160,4 +1162,12 @@ mod tests {
         assert_eq!(glyph_text(b"approxequal").as_deref(), Some("≈"));
         assert_eq!(glyph_text(b"summationdisplay").as_deref(), Some("∑"));
     }
+}
+
+#[test]
+fn removes_invisible_glyphs_without_replacement_characters() {
+    assert_eq!(
+        normalize("co\u{ad}op\u{200b}er\u{200d}a\u{feff}te\0".chars()),
+        "cooperate"
+    );
 }

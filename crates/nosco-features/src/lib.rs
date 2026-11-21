@@ -100,3 +100,8 @@ fn boundary(start: bool, end: bool, labels: [&'static str; 3]) -> &'static str {
 
 const LINE: [&str; 3] = ["LINESTART", "LINEIN", "LINEEND"];
 const BLOCK: [&str; 3] = ["BLOCKSTART", "BLOCKIN", "BLOCKEND"];
+
+/// Whether the PDF token produces a feature row.
+pub fn visible_layout_text(text: &str) -> bool {
+    clean_token(text).is_some()
+}

@@ -33,6 +33,8 @@ pub struct Date {
 #[serde(default)]
 pub struct Person {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_name: Option<String>,
@@ -102,6 +104,8 @@ pub struct Header {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub authors: Vec<Person>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub editors: Vec<Person>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub affiliations: Vec<Affiliation>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,6 +126,8 @@ pub struct Header {
     pub pmcid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub issn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isbn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eissn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -437,6 +443,7 @@ impl Person {
             .into_iter()
             .all(|part| nonblank(part).is_none())
             && nonblank(self.raw_name.as_deref()).is_none()
+            && nonblank(self.organization.as_deref()).is_none()
             && nonblank(self.email.as_deref()).is_none()
             && nonblank(self.orcid.as_deref()).is_none()
             && self.affiliation_markers.is_empty()
@@ -453,8 +460,9 @@ impl Person {
             .map(str::trim)
             .collect::<Vec<_>>();
         if name.is_empty() {
-            self.raw_name
+            self.organization
                 .as_deref()
+                .or(self.raw_name.as_deref())
                 .unwrap_or_default()
                 .trim()
                 .to_owned()

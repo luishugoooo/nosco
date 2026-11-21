@@ -137,14 +137,14 @@ fn load_model(kind: ModelKind, path: &Path) -> Result<CrfModel, EngineError> {
 
 /// Immutable models and lexicon. Calls may share an engine across threads.
 pub struct Engine {
-    models: Vec<CrfModel>,
+    models: Vec<Option<CrfModel>>,
     lexicon: Lexicon,
 }
 
 impl fmt::Debug for Engine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Engine")
-            .field("models", &self.models.len())
+            .field("models", &self.models.iter().flatten().count())
             .finish_non_exhaustive()
     }
 }
@@ -153,21 +153,55 @@ impl Engine {
     /// Opens a compact pack or a raw GROBID home.
     pub fn load(assets_dir: &Path) -> Result<Self, EngineError> {
         let compact = assets_dir.join(LEXICON_FILE).exists()
-            || ModelKind::ALL.iter().any(|kind| assets_dir.join(kind.compact_path()).exists());
-        Self::load_assets(assets_dir, compact)
+            || ModelKind::ALL
+                .iter()
+                .any(|kind| assets_dir.join(kind.compact_path()).exists());
+        Self::load_assets(assets_dir, compact, false)
     }
 
     pub fn load_from_grobid_home(grobid_home: &Path) -> Result<Self, EngineError> {
-        Self::load_assets(grobid_home, false)
+        Self::load_assets(grobid_home, false, false)
     }
 
-    fn load_assets(dir: &Path, compact: bool) -> Result<Self, EngineError> {
+    /// Loads the models required to extract headers. Venue parsing is optional.
+    pub fn load_for_header(assets_dir: &Path) -> Result<Self, EngineError> {
+        let compact = assets_dir.join(LEXICON_FILE).exists()
+            || assets_dir.join(ModelKind::Header.compact_path()).exists();
+        Self::load_assets(assets_dir, compact, true)
+    }
+
+    fn load_assets(dir: &Path, compact: bool, header_only: bool) -> Result<Self, EngineError> {
         let (models, lexicon) = rayon::join(
             || {
-                ModelKind::ALL.par_iter().map(|&kind| {
-                    let relative = if compact { kind.compact_path() } else { kind.wapiti_path() };
-                    load_model(kind, &dir.join(relative))
-                }).collect::<Result<Vec<_>, _>>()
+                ModelKind::ALL
+                    .par_iter()
+                    .map(|&kind| {
+                        let relative = if compact {
+                            kind.compact_path()
+                        } else {
+                            kind.wapiti_path()
+                        };
+                        let path = dir.join(relative);
+                        if header_only
+                            && matches!(
+                                kind,
+                                ModelKind::ReferenceSegmenter
+                                    | ModelKind::Fulltext
+                                    | ModelKind::Figure
+                                    | ModelKind::Table
+                            )
+                        {
+                            return Ok(None);
+                        }
+                        if header_only
+                            && matches!(kind, ModelKind::Citation | ModelKind::NameCitation)
+                            && !path.exists()
+                        {
+                            return Ok(None);
+                        }
+                        load_model(kind, &path).map(Some)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
             },
             || if compact {
                 Lexicon::load_glex(&dir.join(LEXICON_FILE))
@@ -183,7 +217,12 @@ impl Engine {
     }
 
     pub fn model(&self, kind: ModelKind) -> &CrfModel {
-        &self.models[kind as usize]
+        self.model_if_loaded(kind)
+            .expect("requested model was not loaded")
+    }
+
+    pub(crate) fn model_if_loaded(&self, kind: ModelKind) -> Option<&CrfModel> {
+        self.models[kind as usize].as_ref()
     }
 
     pub(crate) fn tag(
@@ -192,8 +231,11 @@ impl Engine {
         features: &FeatureMatrix,
         scratch: &mut DecodeScratch,
     ) -> Result<Vec<&str>, EngineError> {
-        let model = self.model(kind);
-        let ids = model.tag(features.as_rows(), scratch)
+        let model = self
+            .model_if_loaded(kind)
+            .ok_or(EngineError::MissingModel(kind))?;
+        let ids = model
+            .tag(features.as_rows(), scratch)
             .map_err(|source| EngineError::Decode { kind, source })?;
         Ok(ids.into_iter().map(|id| model.label_name(id)).collect())
     }

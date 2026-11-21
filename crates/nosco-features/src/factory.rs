@@ -145,7 +145,7 @@ pub fn suffix(s: &str, n: usize) -> String {
     s[start..].to_owned()
 }
 
-pub(crate) fn java_letter(c: char) -> bool {
+pub fn java_letter(c: char) -> bool {
     c.is_ascii_alphabetic()
         || (!c.is_ascii() && c.len_utf16() == 1 && LETTER.is_match(c.encode_utf8(&mut [0; 4])))
 }

@@ -327,7 +327,10 @@ fn cmd_process(
     jobs: Option<usize>,
 ) -> Result<()> {
     configure_threads(jobs)?;
-    let engine = Engine::load(models)?;
+    let engine = match mode {
+        ProcessMode::Header => Engine::load_for_header(models)?,
+        _ => Engine::load(models)?,
+    };
     let tei_opts = TeiOptions {
         pretty,
         include_coordinates: coords,
@@ -461,7 +464,10 @@ fn cmd_bench(
 ) -> Result<()> {
     configure_threads(jobs)?;
     let t_load = Instant::now();
-    let engine = Engine::load(models)?;
+    let engine = match mode {
+        ProcessMode::Header => Engine::load_for_header(models)?,
+        _ => Engine::load(models)?,
+    };
     let load_ms = t_load.elapsed().as_secs_f64() * 1000.0;
 
     let pdfs = if input.is_file() {

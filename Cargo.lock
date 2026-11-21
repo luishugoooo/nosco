@@ -643,6 +643,7 @@ dependencies = [
 name = "nosco-engine"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "nosco-crf",
  "nosco-features",
  "nosco-lexicon",
@@ -690,6 +691,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "lopdf",
+ "quick-xml",
  "serde",
  "thiserror",
  "unicode-normalization",

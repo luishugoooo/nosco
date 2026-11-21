@@ -18,6 +18,8 @@ use nosco_pdf::PdfError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    #[error("{0} model was not loaded")]
+    MissingModel(ModelKind),
     #[error("{path}: {source}")]
     Io {
         path: PathBuf,

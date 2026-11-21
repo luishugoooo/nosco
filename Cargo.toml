@@ -26,6 +26,7 @@ nosco-engine = { path = "crates/nosco-engine" }
 
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["now"] }
 flate2 = "1.1"
 lopdf = "0.47"
 memmap2 = "0.9"

@@ -145,7 +145,10 @@ fn inherited<'a>(doc: &'a Document, mut node: &'a Dictionary, key: &[u8]) -> Opt
     None
 }
 
-pub(crate) fn extract(doc: &Document) -> Result<LayoutDocument, PdfError> {
+pub(crate) fn extract(
+    doc: &Document,
+    options: crate::ExtractOptions,
+) -> Result<LayoutDocument, PdfError> {
     let metadata = entry(doc, &doc.trailer, b"Info").and_then(|object| object.as_dict().ok());
     let field = |key: &[u8]| {
         let value = entry(doc, metadata?, key)?;
@@ -161,6 +164,19 @@ pub(crate) fn extract(doc: &Document) -> Result<LayoutDocument, PdfError> {
             keywords: field(b"Keywords"),
             creator: field(b"Creator"),
             producer: field(b"Producer"),
+            doi: field(b"doi")
+                .or_else(|| field(b"DOI"))
+                .or_else(|| field(b"WPS-ARTICLEDOI")),
+            isbn: field(b"ISBN"),
+            issn: field(b"ISSN"),
+            arxiv: field(b"arXiv"),
+            creation_date: field(b"CreationDate"),
+            modified_date: field(b"ModDate"),
+            xmp: entry(doc, &doc.trailer, b"Root")
+                .and_then(|root| entry(doc, root.as_dict().ok()?, b"Metadata"))
+                .and_then(|metadata| stream_bytes(doc, metadata.as_stream().ok()?).ok())
+                .map(|xml| crate::metadata::parse_xmp(&xml))
+                .unwrap_or_default(),
         },
         ..LayoutDocument::default()
     };
@@ -174,126 +190,153 @@ pub(crate) fn extract(doc: &Document) -> Result<LayoutDocument, PdfError> {
         remaining: CONTENT_LIMIT,
     };
     let mut page_numbers: HashMap<ObjectId, usize> = HashMap::new();
-    for (page, id) in doc.page_iter().enumerate() {
+    let mut first_error = None;
+    for (page, id) in doc
+        .page_iter()
+        .take(options.max_pages.unwrap_or(usize::MAX))
+        .enumerate()
+    {
         let page = page + 1;
         page_numbers.insert(id, page);
         let error = |message| PdfError::Page { page, message };
-        let node = doc
-            .get_dictionary(id)
-            .map_err(|cause| error(cause.to_string()))?;
-        let rectangle = |key: &[u8]| {
-            let array = inherited(doc, node, key)?.as_array().ok()?;
-            let [x0, y0, x1, y1] = numbers(array)?;
-            Some(BoundingBox::new(
-                page,
-                x0.min(x1),
-                y0.min(y1),
-                (x1 - x0).abs(),
-                (y1 - y0).abs(),
-            ))
-        };
-        let media = rectangle(b"MediaBox");
-        let crop = match (media, rectangle(b"CropBox")) {
-            (Some(media), Some(crop)) => media.intersection(&crop, false).or(Some(media)),
-            (media, crop) => crop.or(media),
-        }
-        .filter(|rect| rect.width > 0.0 && rect.height > 0.0)
-        .ok_or_else(|| error("missing or empty page box".into()))?;
-        let rotate = inherited(doc, node, b"Rotate")
-            .and_then(|obj| obj.as_i64().ok())
-            .unwrap_or(0)
-            .rem_euclid(360);
-        let unit = entry(doc, node, b"UserUnit")
-            .and_then(number)
-            .filter(|&value| value > 0.0 && value <= 75000.0)
-            .unwrap_or(1.0);
-        let transform = Matrix::scale(unit, unit).then(match rotate {
-            90 => Matrix([0.0, 1.0, 1.0, 0.0, -crop.y, -crop.x]),
-            180 => Matrix([-1.0, 0.0, 0.0, 1.0, crop.x2(), -crop.y]),
-            270 => Matrix([0.0, -1.0, -1.0, 0.0, crop.y2(), crop.x2()]),
-            _ => Matrix([1.0, 0.0, 0.0, -1.0, -crop.x, crop.y2()]),
-        });
-        let (width, height) = if matches!(rotate, 90 | 270) {
-            (crop.height * unit, crop.width * unit)
-        } else {
-            (crop.width * unit, crop.height * unit)
-        };
-        let page_box = BoundingBox::new(page, 0.0, 0.0, width, height);
-        extract_page_links(doc, node, page, transform, &mut output.links);
-        let resources = inherited(doc, node, b"Resources").and_then(|obj| obj.as_dict().ok());
-        interpreter.remaining = CONTENT_LIMIT;
-        if let Some(contents) = entry(doc, node, b"Contents") {
-            let data: Cow<'_, [u8]> = if let Ok(array) = contents.as_array() {
-                let mut data = Vec::new();
-                for stream in array
-                    .iter()
-                    .filter_map(|obj| resolve(doc, obj)?.as_stream().ok())
-                {
-                    let bytes =
-                        stream_bytes(doc, stream).map_err(|cause| error(cause.to_string()))?;
-                    if bytes.len() >= CONTENT_LIMIT.saturating_sub(data.len()) {
-                        return Err(error("page content exceeds decode limit".into()));
-                    }
-                    data.extend_from_slice(&bytes);
-                    data.push(b'\n');
-                }
-                Cow::Owned(data)
-            } else if let Ok(stream) = contents.as_stream() {
-                stream_bytes(doc, stream).map_err(|cause| error(cause.to_string()))?
-            } else {
-                Cow::Borrowed(&[])
+        let links_start = output.links.len();
+        let result = (|| -> Result<(), PdfError> {
+            let node = doc
+                .get_dictionary(id)
+                .map_err(|cause| error(cause.to_string()))?;
+            let rectangle = |key: &[u8]| {
+                let array = inherited(doc, node, key)?.as_array().ok()?;
+                let [x0, y0, x1, y1] = numbers(array)?;
+                Some(BoundingBox::new(
+                    page,
+                    x0.min(x1),
+                    y0.min(y1),
+                    (x1 - x0).abs(),
+                    (y1 - y0).abs(),
+                ))
             };
-            interpreter
-                .run(
-                    &data,
-                    resources,
-                    State {
-                        ctm: transform,
-                        clip: page_box,
-                        ..State::default()
-                    },
-                )
-                .map_err(error)?;
-        }
-        let orcid_boxes: Vec<BoundingBox> = output
-            .links
-            .iter()
-            .filter(|l| l.page == page && l.uri.to_ascii_lowercase().contains("orcid.org/"))
-            .map(|l| l.bbox)
-            .collect();
-        if !orcid_boxes.is_empty() {
-            interpreter.glyphs.retain(|g| {
-                let text = g.text.as_str();
-                if text.is_empty() || !text.chars().all(|c| matches!(c, ']' | '[')) {
-                    return true;
-                }
-                let cx = g.bbox.x + g.bbox.width / 2.0;
-                let cy = g.bbox.y + g.bbox.height / 2.0;
-                !orcid_boxes.iter().any(|b| {
-                    cx >= b.x - 2.0 && cx <= b.x2() + 2.0 && cy >= b.y - 2.0 && cy <= b.y2() + 2.0
-                })
+            let media = rectangle(b"MediaBox");
+            let crop = match (media, rectangle(b"CropBox")) {
+                (Some(media), Some(crop)) => media.intersection(&crop, false).or(Some(media)),
+                (media, crop) => crop.or(media),
+            }
+            .filter(|rect| rect.width > 0.0 && rect.height > 0.0)
+            .ok_or_else(|| error("missing or empty page box".into()))?;
+            let rotate = inherited(doc, node, b"Rotate")
+                .and_then(|obj| obj.as_i64().ok())
+                .unwrap_or(0)
+                .rem_euclid(360);
+            let unit = entry(doc, node, b"UserUnit")
+                .and_then(number)
+                .filter(|&value| value > 0.0 && value <= 75000.0)
+                .unwrap_or(1.0);
+            let transform = Matrix::scale(unit, unit).then(match rotate {
+                90 => Matrix([0.0, 1.0, 1.0, 0.0, -crop.y, -crop.x]),
+                180 => Matrix([-1.0, 0.0, 0.0, 1.0, crop.x2(), -crop.y]),
+                270 => Matrix([0.0, -1.0, -1.0, 0.0, crop.y2(), crop.x2()]),
+                _ => Matrix([1.0, 0.0, 0.0, -1.0, -crop.x, crop.y2()]),
             });
+            let (width, height) = if matches!(rotate, 90 | 270) {
+                (crop.height * unit, crop.width * unit)
+            } else {
+                (crop.width * unit, crop.height * unit)
+            };
+            let page_box = BoundingBox::new(page, 0.0, 0.0, width, height);
+            extract_page_links(doc, node, page, transform, &mut output.links);
+            let resources = inherited(doc, node, b"Resources").and_then(|obj| obj.as_dict().ok());
+            interpreter.remaining = CONTENT_LIMIT;
+            if let Some(contents) = entry(doc, node, b"Contents") {
+                let data: Cow<'_, [u8]> = if let Ok(array) = contents.as_array() {
+                    let mut data = Vec::new();
+                    for stream in array
+                        .iter()
+                        .filter_map(|obj| resolve(doc, obj)?.as_stream().ok())
+                    {
+                        let bytes =
+                            stream_bytes(doc, stream).map_err(|cause| error(cause.to_string()))?;
+                        if bytes.len() >= CONTENT_LIMIT.saturating_sub(data.len()) {
+                            return Err(error("page content exceeds decode limit".into()));
+                        }
+                        data.extend_from_slice(&bytes);
+                        data.push(b'\n');
+                    }
+                    Cow::Owned(data)
+                } else if let Ok(stream) = contents.as_stream() {
+                    stream_bytes(doc, stream).map_err(|cause| error(cause.to_string()))?
+                } else {
+                    Cow::Borrowed(&[])
+                };
+                interpreter
+                    .run(
+                        &data,
+                        resources,
+                        State {
+                            ctm: transform,
+                            clip: page_box,
+                            ..State::default()
+                        },
+                    )
+                    .map_err(error)?;
+            }
+            let orcid_boxes: Vec<BoundingBox> = output
+                .links
+                .iter()
+                .filter(|l| l.page == page && l.uri.to_ascii_lowercase().contains("orcid.org/"))
+                .map(|l| l.bbox)
+                .collect();
+            if !orcid_boxes.is_empty() {
+                interpreter.glyphs.retain(|g| {
+                    let text = g.text.as_str();
+                    if text.is_empty() || !text.chars().all(|c| matches!(c, ']' | '[')) {
+                        return true;
+                    }
+                    let cx = g.bbox.x + g.bbox.width / 2.0;
+                    let cy = g.bbox.y + g.bbox.height / 2.0;
+                    !orcid_boxes.iter().any(|b| {
+                        cx >= b.x - 2.0
+                            && cx <= b.x2() + 2.0
+                            && cy >= b.y - 2.0
+                            && cy <= b.y2() + 2.0
+                    })
+                });
+            }
+            let mut info = PageInfo {
+                number: page,
+                width,
+                height,
+                main_area: page_box,
+                block_range: output.blocks.len()..output.blocks.len(),
+                line_range: output.lines.len()..output.lines.len(),
+                token_range: output.tokens.len()..output.tokens.len(),
+            };
+            layout::append_page(
+                &mut output,
+                &mut info,
+                &mut interpreter.glyphs,
+                &interpreter.fonts,
+                &interpreter.graphics,
+            );
+            output.graphics.append(&mut interpreter.graphics);
+            output.pages.push(info);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            eprintln!("Skipping PDF page: {error}");
+            first_error.get_or_insert(error);
+            interpreter.glyphs.clear();
+            interpreter.graphics.clear();
+            interpreter.active_forms.clear();
+            output.links.truncate(links_start);
         }
-        let mut info = PageInfo {
-            number: page,
-            width,
-            height,
-            main_area: page_box,
-            block_range: output.blocks.len()..output.blocks.len(),
-            line_range: output.lines.len()..output.lines.len(),
-            token_range: output.tokens.len()..output.tokens.len(),
-        };
-        layout::append_page(
-            &mut output,
-            &mut info,
-            &mut interpreter.glyphs,
-            &interpreter.fonts,
-            &interpreter.graphics,
-        );
-        output.graphics.append(&mut interpreter.graphics);
-        output.pages.push(info);
     }
-    extract_outlines(doc, &page_numbers, &mut output.outlines);
+    if output.pages.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
+    }
+    if options.max_pages.is_none() {
+        extract_outlines(doc, &page_numbers, &mut output.outlines);
+    }
     Ok(output)
 }
 
@@ -357,7 +400,11 @@ fn extract_outlines(
     let Some(outlines) = entry(doc, root, b"Outlines").and_then(|obj| obj.as_dict().ok()) else {
         return;
     };
-    let Some(first) = outlines.get(b"First").ok().and_then(|obj| obj.as_reference().ok()) else {
+    let Some(first) = outlines
+        .get(b"First")
+        .ok()
+        .and_then(|obj| obj.as_reference().ok())
+    else {
         return;
     };
     let mut visited = HashSet::new();

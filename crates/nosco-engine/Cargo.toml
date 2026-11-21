@@ -6,6 +6,7 @@ license.workspace = true
 description = "Full scholarly PDF and bibliographic parsing cascade engine"
 
 [dependencies]
+chrono.workspace = true
 nosco-crf.workspace = true
 nosco-features.workspace = true
 nosco-lexicon.workspace = true

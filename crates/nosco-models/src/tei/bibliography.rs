@@ -91,6 +91,10 @@ impl TeiWriter<'_> {
                 xml.leaf("title", header.journal.as_deref(), &[("level", "j")])?;
                 xml.leaf("idno", header.issn.as_deref(), &[("type", "ISSN")])?;
                 xml.leaf("idno", header.eissn.as_deref(), &[("type", "eISSN")])?;
+                xml.leaf("idno", header.isbn.as_deref(), &[("type", "ISBN")])?;
+                for editor in &header.editors {
+                    xml.person("editor", editor, &[], &mut [])?;
+                }
                 xml.leaf("meeting", header.meeting.as_deref(), &[])?;
                 xml.element("imprint", &[], |xml| {
                     xml.leaf("publisher", header.publisher.as_deref(), &[])?;
@@ -339,7 +343,11 @@ impl TeiWriter<'_> {
         }
         let corresp = if person.corresp { "corresp" } else { "" };
         self.element(role, &[("role", corresp)], |xml| {
-            xml.person_name(person)?;
+            if let Some(organization) = person.organization.as_deref() {
+                xml.leaf("orgName", Some(organization), &[])?;
+            } else {
+                xml.person_name(person)?;
+            }
             xml.leaf("email", person.email.as_deref(), &[])?;
             xml.leaf("idno", person.orcid.as_deref(), &[("type", "ORCID")])?;
             for (affiliation, linked) in affiliations.iter().zip(linked) {

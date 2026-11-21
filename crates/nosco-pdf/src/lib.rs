@@ -6,6 +6,7 @@ mod cmap;
 mod fonts;
 mod interpreter;
 mod layout;
+mod metadata;
 mod truetype;
 
 use std::{collections::BTreeMap, ops::Range, path::Path};
@@ -165,6 +166,7 @@ pub struct PdfOutline {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PdfMetadata {
     pub title: Option<String>,
     pub author: Option<String>,
@@ -172,6 +174,13 @@ pub struct PdfMetadata {
     pub keywords: Option<String>,
     pub creator: Option<String>,
     pub producer: Option<String>,
+    pub doi: Option<String>,
+    pub isbn: Option<String>,
+    pub issn: Option<String>,
+    pub arxiv: Option<String>,
+    pub creation_date: Option<String>,
+    pub modified_date: Option<String>,
+    pub xmp: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,41 +273,90 @@ fn tokens_text(tokens: &[LayoutToken]) -> String {
     text
 }
 
-/// Extract text, layout and graphics from an in-memory PDF.
+/// Limits for extraction. Page numbers always refer to the original PDF.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExtractOptions {
+    pub max_pages: Option<usize>,
+}
+
 pub fn extract_from_bytes(bytes: &[u8]) -> Result<LayoutDocument, PdfError> {
-    let pdf =
-        lopdf::Document::load_mem(bytes).map_err(|error| PdfError::Parse(error.to_string()))?;
-    extract(pdf)
+    extract_from_bytes_with_options(bytes, ExtractOptions::default())
 }
 
-/// Read a PDF from a file and extract its text, layout and graphics.
+pub fn extract_from_bytes_with_options(
+    bytes: &[u8],
+    options: ExtractOptions,
+) -> Result<LayoutDocument, PdfError> {
+    let mut pdf = lopdf::Document::load_mem_with_options(
+        bytes,
+        lopdf::LoadOptions::with_filter(strip_raster),
+    )
+    .map_err(|error| PdfError::Parse(error.to_string()))?;
+    if pdf.page_iter().next().is_none() {
+        pdf =
+            lopdf::Document::load_mem(bytes).map_err(|error| PdfError::Parse(error.to_string()))?;
+    }
+    extract(pdf, options)
+}
+
 pub fn extract_from_file(path: &Path) -> Result<LayoutDocument, PdfError> {
-    let file = std::fs::File::open(path).map_err(|error| PdfError::Io(error.to_string()))?;
-    let pdf = lopdf::Document::load_from(file).map_err(|error| match error {
-        lopdf::Error::IO(error) => PdfError::Io(error.to_string()),
-        error => PdfError::Parse(error.to_string()),
-    })?;
-    extract(pdf)
+    extract_from_file_with_options(path, ExtractOptions::default())
 }
 
-fn extract(mut pdf: lopdf::Document) -> Result<LayoutDocument, PdfError> {
+pub fn extract_from_file_with_options(
+    path: &Path,
+    options: ExtractOptions,
+) -> Result<LayoutDocument, PdfError> {
+    let mut pdf =
+        lopdf::Document::load_with_options(path, lopdf::LoadOptions::with_filter(strip_raster))
+            .map_err(|error| match error {
+                lopdf::Error::IO(error) => PdfError::Io(error.to_string()),
+                error => PdfError::Parse(error.to_string()),
+            })?;
+    if pdf.page_iter().next().is_none() {
+        pdf = lopdf::Document::load(path).map_err(|error| PdfError::Parse(error.to_string()))?;
+    }
+    extract(pdf, options)
+}
+
+fn strip_raster(
+    id: lopdf::ObjectId,
+    object: &mut lopdf::Object,
+) -> Option<(lopdf::ObjectId, lopdf::Object)> {
+    if let Ok(stream) = object.as_stream_mut() {
+        discard_image_bytes(stream);
+        // lopdf uses the in-place object for xref entries. Objects contained
+        // in object streams use the returned value and cannot be streams.
+        Some((id, lopdf::Object::Null))
+    } else {
+        Some((id, object.clone()))
+    }
+}
+
+fn discard_image_bytes(stream: &mut lopdf::Stream) {
+    if stream
+        .dict
+        .get(b"Subtype")
+        .and_then(lopdf::Object::as_name)
+        .ok()
+        == Some(b"Image")
+    {
+        stream.content = Vec::new();
+        // An empty stream with a saved offset would be read again by lopdf.
+        stream.start_position = None;
+    }
+}
+
+fn extract(mut pdf: lopdf::Document, options: ExtractOptions) -> Result<LayoutDocument, PdfError> {
     if pdf.is_encrypted() {
         pdf.decrypt("")
             .map_err(|error| PdfError::Encrypted(error.to_string()))?;
     }
-    // Layout extraction needs only image dictionaries and placement matrices.
-    // Release the raster data before accumulating tokens for the document.
+    // The encrypted and recovery paths may bypass the object filter.
     for object in pdf.objects.values_mut() {
-        if let Ok(stream) = object.as_stream_mut()
-            && stream
-                .dict
-                .get(b"Subtype")
-                .and_then(lopdf::Object::as_name)
-                .ok()
-                == Some(b"Image")
-        {
-            stream.content = Vec::new();
+        if let Ok(stream) = object.as_stream_mut() {
+            discard_image_bytes(stream);
         }
     }
-    interpreter::extract(&pdf)
+    interpreter::extract(&pdf, options)
 }

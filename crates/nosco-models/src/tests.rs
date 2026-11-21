@@ -533,3 +533,27 @@ fn example_document() -> Document {
         page_count: 3,
     }
 }
+
+#[test]
+fn header_encodes_book_isbn_editors_and_institutional_authors() {
+    let header = Header {
+        isbn: Some("9780387324586".into()),
+        authors: vec![Person {
+            organization: Some("Example Research Group".into()),
+            ..Default::default()
+        }],
+        editors: vec![Person {
+            first_name: Some("Jonathan".into()),
+            last_name: Some("Turner".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let tei = header_to_tei_xml(&header, &TeiOptions::default()).unwrap();
+    assert!(tei.contains("<idno type=\"ISBN\">9780387324586</idno>"));
+    assert!(tei.contains("<orgName>Example Research Group</orgName>"));
+    assert!(tei.contains("<editor>"));
+    assert!(tei.contains("<surname>Turner</surname>"));
+    let old: Header = serde_json::from_str(r#"{"title":"Book"}"#).unwrap();
+    assert!(old.editors.is_empty() && old.isbn.is_none());
+}

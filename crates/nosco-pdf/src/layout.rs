@@ -258,7 +258,10 @@ fn attach_scripts(lines: &mut Vec<Line>) {
                 }
                 continue;
             }
-            if script.size >= line.size * 0.87 || delta > 0.62 * line.size {
+            if (line.glyphs.len() == 1 && accent(line.glyphs[0].text.as_str()).is_some())
+                || script.size >= line.size * 0.87
+                || delta > 0.62 * line.size
+            {
                 continue;
             }
             let mut overlap: f64 = 0.0;
@@ -283,16 +286,29 @@ fn attach_scripts(lines: &mut Vec<Line>) {
         targets[index] = best.map(|(index, _)| index);
     }
     for index in 0..lines.len() {
-        if let Some(mut target) = targets[index] {
-            while let Some(parent) = targets[target] {
-                target = parent;
-            }
+        if let Some(target) = targets[index].and_then(|target| script_root(&targets, target)) {
             let glyphs = std::mem::take(&mut lines[index].glyphs);
             lines[target].glyphs.extend(glyphs);
             lines[target].update_bounds();
         }
     }
     lines.retain(|line| !line.glyphs.is_empty());
+}
+
+fn script_root(targets: &[Option<usize>], mut target: usize) -> Option<usize> {
+    for _ in targets {
+        match targets[target] {
+            Some(parent) => target = parent,
+            None => return Some(target),
+        }
+    }
+    None
+}
+
+#[test]
+fn script_cycles_have_no_root() {
+    assert_eq!(script_root(&[Some(1), Some(0)], 0), None);
+    assert_eq!(script_root(&[Some(1), None], 0), Some(1));
 }
 
 fn accent(text: &str) -> Option<char> {

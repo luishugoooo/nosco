@@ -329,3 +329,67 @@ fn cid_font_to_unicode_and_proportional_token_boxes() {
     near(doc.tokens[2].bbox.x, 22.0);
     near(doc.tokens[2].bbox.width, 14.0);
 }
+
+#[test]
+fn windows_pages_recovers_bad_content_and_reads_catalog_metadata() {
+    use nosco_pdf::{ExtractOptions, extract_from_bytes_with_options};
+
+    let mut source = Document::with_version("1.5");
+    let invalid = source.add_object(Stream::new(
+        dictionary! { "Filter" => "JBIG2Decode" },
+        b"broken".to_vec(),
+    ));
+    let mut source = pdf(invalid, Dictionary::new(), Dictionary::new(), source);
+    let root = source.trailer.get(b"Root").unwrap().as_reference().unwrap();
+    let tree = source
+        .get_dictionary(root)
+        .unwrap()
+        .get(b"Pages")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let second = source.add_object(dictionary! { "Type" => "Page", "Parent" => tree });
+    let third = source.add_object(dictionary! { "Type" => "Page", "Parent" => tree });
+    let pages = source.get_object_mut(tree).unwrap().as_dict_mut().unwrap();
+    pages
+        .get_mut(b"Kids")
+        .unwrap()
+        .as_array_mut()
+        .unwrap()
+        .extend([second.into(), third.into()]);
+    pages.set("Count", 3);
+    let xmp = source.add_object(Stream::new(dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+        br#"<rdf:Description><prism:doi>10.1007/example123</prism:doi><dc:title>Catalog title</dc:title></rdf:Description>"#.to_vec()));
+    source
+        .get_object_mut(root)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("Metadata", xmp);
+    let info = source.trailer.get(b"Info").unwrap().as_reference().unwrap();
+    source
+        .get_object_mut(info)
+        .unwrap()
+        .as_dict_mut()
+        .unwrap()
+        .set("WPS-ARTICLEDOI", lopdf::text_string("10.1007/example123"));
+
+    let data = bytes(source);
+    let layout =
+        extract_from_bytes_with_options(&data, ExtractOptions { max_pages: Some(2) }).unwrap();
+    assert_eq!(
+        layout
+            .pages
+            .iter()
+            .map(|page| page.number)
+            .collect::<Vec<_>>(),
+        [2]
+    );
+    assert_eq!(layout.metadata.xmp["dc:title"], ["Catalog title"]);
+    assert_eq!(layout.metadata.doi.as_deref(), Some("10.1007/example123"));
+    assert!(matches!(
+        extract_from_bytes_with_options(&data, ExtractOptions { max_pages: Some(1) }),
+        Err(PdfError::Page { page: 1, .. })
+    ));
+    assert_eq!(extract_from_bytes(&data).unwrap().pages.len(), 2);
+}

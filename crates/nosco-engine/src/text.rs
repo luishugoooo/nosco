@@ -55,7 +55,7 @@ impl<'a> TextInput<'a> {
             let mut previous = ' ';
             for (current, (offset, _)) in token.chars().zip(raw.char_indices()) {
                 if (previous.is_ascii_digit() && !current.is_ascii_digit())
-                    || (previous.is_alphabetic() && previous.len_utf16() == 1 && current.is_ascii_digit())
+                    || (nosco_features::factory::java_letter(previous) && current.is_ascii_digit())
                 {
                     let end = range.start + offset;
                     if visible(&self.source[start..end]) {
@@ -108,9 +108,47 @@ fn month(value: &str) -> Option<u8> {
     Some(month)
 }
 
-fn year(value: &str) -> Option<i32> {
+pub(crate) fn year(value: &str) -> Option<i32> {
     let value = value.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-    (value.len() == 4).then(|| value.parse().ok()).flatten()
+    (value.len() == 4)
+        .then(|| value.parse().ok())
+        .flatten()
+        .filter(|year| (1450..=2035).contains(year))
+}
+
+pub(crate) fn repair_pdf_ligature_glyph(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('Ɵ') {
+        std::borrow::Cow::Owned(text.replace('Ɵ', "ti"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+pub(crate) fn joins_split_ligature(
+    left: &str,
+    right: &str,
+    lexicon: &nosco_lexicon::Lexicon,
+) -> bool {
+    if !left.ends_with("fi") && !left.ends_with("fl") {
+        return false;
+    }
+    let left_word = left
+        .rsplit(|c: char| !c.is_alphabetic())
+        .next()
+        .unwrap_or("");
+    let right_word = right
+        .split(|c: char| !c.is_alphabetic())
+        .next()
+        .unwrap_or("");
+    right_word.starts_with(char::is_lowercase)
+        && left_word
+            .strip_suffix("fi")
+            .or_else(|| left_word.strip_suffix("fl"))
+            .is_some_and(|stem| !stem.is_empty())
+        && (lexicon.in_dictionary(&format!("{left_word}{right_word}"))
+            || (!lexicon.in_dictionary(left_word)
+                && !lexicon.in_dictionary(right_word)
+                && right_word.len() >= 3))
 }
 
 impl Engine {
@@ -181,7 +219,7 @@ impl Engine {
     pub(crate) fn parse_names(&self, text: &str, kind: ModelKind, scratch: &mut DecodeScratch) -> Result<Vec<Person>, EngineError> {
         let mut people = Vec::new();
         let mut start = 0;
-        for orcid in ORCID.captures_iter(text) {
+        for orcid in ORCID.captures_iter(text).filter(|cap| valid_orcid(&cap[1])) {
             let matched = orcid.get(0).unwrap();
             self.name_list(&text[start..matched.start()], kind, scratch, &mut people)?;
             if let Some(person) = people.last_mut() {
@@ -307,17 +345,19 @@ impl Engine {
         let features = extract_affiliation_features(&terms, &input.line_starts, self.lexicon());
         let labels = self.tag(ModelKind::AffiliationAddress, &features, scratch)?;
         let mut output = Vec::new();
+        let offsets =
+            input.filtered(|token| !token.trim().is_empty() && !token.contains("@newline"));
         let mut affiliation = Affiliation::default();
         let mut raw_start = 0;
         let mut previous_end = 0;
         for span in spans(&labels) {
-            let range = &input.offsets[span.rows.start];
-            let raw = input.text(span.rows.clone(), &input.offsets);
+            let range = &offsets[span.rows.start];
+            let raw = input.text(span.rows.clone(), &offsets);
             let value = clean(raw).trim_end_matches('.');
             if value.is_empty() {
                 continue;
             }
-            let end = input.offsets[span.rows.end - 1].end;
+            let end = offsets[span.rows.end - 1].end;
             let newline = text[previous_end..range.start].contains('\n');
             let explicit_marker = AFFILIATION_LINE_MARKER.captures(raw)
                 .is_some_and(|c| clean(c.get(0).unwrap().as_str()) == clean(raw))
@@ -416,10 +456,14 @@ impl Engine {
             };
             append(field, value);
         }
-        if let Some(authors) = authors {
+        if let Some(authors) = authors
+            && self.model_if_loaded(ModelKind::NameCitation).is_some()
+        {
             item.authors = self.parse_names(&authors, ModelKind::NameCitation, scratch)?;
         }
-        if let Some(editors) = editors {
+        if let Some(editors) = editors
+            && self.model_if_loaded(ModelKind::NameCitation).is_some()
+        {
             item.editors = self.parse_names(&editors, ModelKind::NameCitation, scratch)?;
         }
         if let Some(date) = date {
@@ -435,12 +479,15 @@ impl Engine {
         }
         let identifier_text = publication_number.as_deref().unwrap_or_default();
         item.doi = doi(text).or_else(|| doi(identifier_text));
-        item.arxiv_id = capture(&ARXIV, text).or_else(|| capture(&ARXIV, identifier_text));
+        item.arxiv_id = arxiv(text).or_else(|| arxiv(identifier_text));
         item.pmid = capture(&PMID, text);
         item.pmcid = capture(&PMCID, text).map(|value| value.to_ascii_uppercase());
-        item.issn = capture(&ISSN, text);
-        item.isbn = capture(&ISBN, text);
-        item.url = urls(text).next().or_else(|| web.as_deref().and_then(|web| urls(web).next())).map(str::to_owned);
+        item.issn = issn(text, false);
+        item.isbn = isbn(text);
+        item.url = urls(text)
+            .next()
+            .or_else(|| web.as_deref().and_then(|web| urls(web).next()))
+            .map(str::to_owned);
         Ok(item)
     }
 }
@@ -610,6 +657,22 @@ pub(crate) fn markers(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn citation_offsets_follow_java_letter_boundaries() {
+        let source = "Ⅳ12A9";
+        let input = TextInput::new(source);
+        let offsets = input.citation_offsets();
+        let features = extract_citation_features(&input.terms(), &[], &Default::default());
+        assert_eq!(features.len(), offsets.len());
+        assert_eq!(
+            offsets
+                .iter()
+                .map(|range| &source[range.clone()])
+                .collect::<Vec<_>>(),
+            ["Ⅳ12", "A", "9"]
+        );
+    }
 
     #[test]
     fn normalizes_month_day_and_year() {

@@ -8,6 +8,7 @@ description = "Pure-Rust PDF parser, font/CMap decoder, and academic layout anal
 [dependencies]
 flate2.workspace = true
 lopdf.workspace = true
+quick-xml.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true

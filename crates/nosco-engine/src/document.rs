@@ -1,3 +1,7 @@
+mod frontmatter;
+
+use frontmatter::*;
+
 use std::collections::{HashMap, HashSet};
 use std::{path::{Path, PathBuf}, sync::LazyLock};
 
@@ -6,12 +10,15 @@ use nosco_features::{
     extract_header_features, extract_reference_segmenter_input, extract_segmentation_input,
 };
 use nosco_models::{Affiliation, BibItem, Document, Footnote, Header, Person};
-use nosco_pdf::{LayoutDocument, extract_from_bytes, extract_from_file};
+use nosco_pdf::{
+    BoundingBox, ExtractOptions, LayoutDocument, PageInfo, extract_from_bytes,
+    extract_from_bytes_with_options, extract_from_file, extract_from_file_with_options,
+};
 use rayon::prelude::*;
 use regex::Regex;
 
 use crate::identifiers::*;
-use crate::spans::{append, base, bboxes, clean, compact, layout_visible, render, spans};
+use crate::spans::{append, base, bboxes, clean, compact, layout_visible, new_line, render, spans};
 use crate::text::{markers, set_affiliation_keys};
 use crate::{Engine, EngineError, ModelKind};
 
@@ -25,6 +32,9 @@ static INLINE_LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\[\s*\
 static FOOTNOTE_LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\d+|[*†‡])(?:\s+|[.)]\s*)").unwrap());
 static CROSSMARK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bcheck\s+for\s+updates\b").unwrap());
 
+const HEADER_OPTIONS: ExtractOptions = ExtractOptions { max_pages: Some(8) };
+const HEADER_TOKEN_LIMIT: usize = 2500;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Zone {
     Header,
@@ -34,6 +44,8 @@ enum Zone {
     Annex,
     Footnote,
     Cover,
+    Toc,
+    Headnote,
     Funding,
     Other,
 }
@@ -48,6 +60,8 @@ impl Zone {
             "<annex>" => Self::Annex,
             "<footnote>" => Self::Footnote,
             "<cover>" => Self::Cover,
+            "<toc>" => Self::Toc,
+            "<headnote>" => Self::Headnote,
             "<funding>" => Self::Funding,
             _ => Self::Other,
         }
@@ -60,15 +74,69 @@ struct Segmented<'a> {
     starts: Vec<bool>,
     furniture: Vec<bool>,
     badge: Vec<bool>,
+    frontmatter: Frontmatter,
+    lead_override: Vec<usize>,
 }
 
 impl Segmented<'_> {
     fn indices(&self, zone: Zone) -> Vec<usize> {
-        self.layout.lines.iter().enumerate()
-            .filter(|&(i, _)| self.zones[i] == zone && !self.badge[i])
+        self.layout
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| {
+                self.zones[i] == zone
+                    && !self.badge[i]
+                    && (!matches!(zone, Zone::Header | Zone::Body | Zone::References)
+                        || !self.furniture[i])
+            })
             .flat_map(|(_, line)| line.token_range.clone())
             .filter(|&i| self.layout.tokens.get(i).is_some_and(layout_visible))
             .collect()
+    }
+    fn header_indices(&self) -> Vec<usize> {
+        let Some(first_page) = self.frontmatter.primary() else {
+            return Vec::new();
+        };
+        let mut indices = Vec::<usize>::new();
+        let mut page = first_page;
+        for (i, line) in self
+            .layout
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.page >= first_page)
+        {
+            if line.page > first_page + 2
+                || line.page > page + 1
+                || self.frontmatter.excluded.contains(&line.page)
+            {
+                break;
+            }
+            page = line.page;
+            if self.furniture[i] || self.badge[i] {
+                continue;
+            }
+            let zone = if self.lead_override.contains(&i) {
+                Zone::Header
+            } else {
+                self.zones[i]
+            };
+            match zone {
+                Zone::Body | Zone::Toc => break,
+                Zone::Header => indices.extend(
+                    line.token_range
+                        .clone()
+                        .filter(|&j| layout_visible(&self.layout.tokens[j])),
+                ),
+                _ => {}
+            }
+            if indices.len() >= HEADER_TOKEN_LIMIT {
+                indices.truncate(HEADER_TOKEN_LIMIT);
+                break;
+            }
+        }
+        indices
     }
 }
 
@@ -82,11 +150,11 @@ impl Engine {
     }
 
     pub fn process_header_file(&self, path: &Path) -> Result<Header, EngineError> {
-        self.process_header_layout(&extract_from_file(path)?)
+        self.process_header_layout(&extract_from_file_with_options(path, HEADER_OPTIONS)?)
     }
 
     pub fn process_header_bytes(&self, bytes: &[u8]) -> Result<Header, EngineError> {
-        self.process_header_layout(&extract_from_bytes(bytes)?)
+        self.process_header_layout(&extract_from_bytes_with_options(bytes, HEADER_OPTIONS)?)
     }
 
     pub fn process_references_file(&self, path: &Path) -> Result<Vec<BibItem>, EngineError> {
@@ -103,7 +171,7 @@ impl Engine {
 
     pub fn process_layout(&self, layout: &LayoutDocument) -> Result<Document, EngineError> {
         let mut scratch = DecodeScratch::new();
-        let segments = self.segment(layout, &mut scratch)?;
+        let segments = self.segment(layout, &mut scratch, true)?;
         let header = self.header(&segments, &mut scratch)?;
         let references = self.references(&segments, &mut scratch)?;
         let mut document = Document { header, references, page_count: layout.pages.len(), ..Default::default() };
@@ -121,17 +189,22 @@ impl Engine {
 
     pub fn process_header_layout(&self, layout: &LayoutDocument) -> Result<Header, EngineError> {
         let mut scratch = DecodeScratch::new();
-        let segments = self.segment(layout, &mut scratch)?;
+        let segments = self.segment(layout, &mut scratch, false)?;
         self.header(&segments, &mut scratch)
     }
 
     pub fn process_references_layout(&self, layout: &LayoutDocument) -> Result<Vec<BibItem>, EngineError> {
         let mut scratch = DecodeScratch::new();
-        let segments = self.segment(layout, &mut scratch)?;
+        let segments = self.segment(layout, &mut scratch, true)?;
         self.references(&segments, &mut scratch)
     }
 
-    fn segment<'a>(&self, layout: &'a LayoutDocument, scratch: &mut DecodeScratch) -> Result<Segmented<'a>, EngineError> {
+    fn segment<'a>(
+        &self,
+        layout: &'a LayoutDocument,
+        scratch: &mut DecodeScratch,
+        scan_references: bool,
+    ) -> Result<Segmented<'a>, EngineError> {
         let input = extract_segmentation_input(layout, self.lexicon());
         let labels = self.tag(ModelKind::Segmentation, &input.features, scratch)?;
         let mut zones = vec![Zone::Other; layout.lines.len()];
@@ -149,28 +222,40 @@ impl Engine {
 
         let (furniture, badge) = detect_furniture_and_badges(layout, self.lexicon());
 
-        if !zones.contains(&Zone::Header) {
-            let cover = zones.contains(&Zone::Cover);
-            let first_page = layout.lines.first().map(|line| line.page);
-            for (i, zone) in zones.iter_mut().enumerate() {
-                if *zone == Zone::Cover
-                    || (!cover && Some(layout.lines[i].page) == first_page && i < 28
-                        && matches!(*zone, Zone::Other | Zone::Body))
-                {
-                    if FIRST_SECTION.is_match(&line_text(i)) {
+        let frontmatter = Frontmatter::detect(layout, &zones, self.lexicon());
+        let mut lead_override = Vec::new();
+        if let Some(page) = frontmatter.primary() {
+            let visible = layout
+                .lines
+                .iter()
+                .enumerate()
+                .filter(|(i, line)| line.page == page && !furniture[*i] && !badge[*i]);
+            // Segmentation sometimes tags a title page as cover or body. In that
+            // case give the header model the bounded lead of the selected page.
+            let has_leading_header = visible
+                .clone()
+                .take_while(|(i, _)| !matches!(zones[*i], Zone::Body | Zone::Toc))
+                .any(|(i, _)| zones[i] == Zone::Header);
+            if !has_leading_header {
+                for (i, _) in visible.take(28) {
+                    if zones[i] == Zone::Toc || FIRST_SECTION.is_match(&line_text(i)) {
                         break;
                     }
-                    *zone = Zone::Header;
+                    if matches!(zones[i], Zone::Other | Zone::Body | Zone::Cover) {
+                        lead_override.push(i);
+                    }
                 }
             }
         }
 
         // A recognizable bibliography heading anchors the reference tail even
         // when the segmentation model only finds the middle of the zone.
-        if let Some(heading) = (0..zones.len()).rev().find(|&i| {
-            matches!(zones[i], Zone::References | Zone::Body | Zone::Other)
-                && REF_HEADING.is_match(line_text(i).trim())
-        }) {
+        if scan_references
+            && let Some(heading) = (0..zones.len()).rev().find(|&i| {
+                matches!(zones[i], Zone::References | Zone::Body | Zone::Other)
+                    && REF_HEADING.is_match(line_text(i).trim())
+            })
+        {
             for (i, zone) in zones.iter_mut().enumerate().skip(heading + 1) {
                 if *zone == Zone::Annex || (*zone == Zone::Body && BACK_HEADING.is_match(&line_text(i))) {
                     break;
@@ -181,48 +266,136 @@ impl Engine {
             }
             zones[heading] = Zone::Other;
         }
-        Ok(Segmented { layout, zones, starts, furniture, badge })
+        Ok(Segmented {
+            layout,
+            zones,
+            starts,
+            furniture,
+            badge,
+            frontmatter,
+            lead_override,
+        })
     }
 
     fn header(&self, segments: &Segmented<'_>, scratch: &mut DecodeScratch) -> Result<Header, EngineError> {
         let layout = segments.layout;
-        let indices = segments.indices(Zone::Header);
-        let labels = self.tag(ModelKind::Header, &extract_header_features(layout, &indices, self.lexicon()), scratch)?;
+        let indices = segments.header_indices();
+        let labels = self.tag(
+            ModelKind::Header,
+            &extract_header_features(layout, &indices, self.lexicon()),
+            scratch,
+        )?;
         let mut header = Header::default();
         let mut affiliation = Vec::new();
         let mut segmented_emails = Vec::new();
         let mut abstract_indices: Vec<usize> = Vec::new();
+        let mut author_positions = Vec::new();
+        let mut date_candidates = Vec::new();
+        let mut venue_spans = Vec::new();
+        let mut title_page = None;
+        let raw = render(layout, &indices, self.lexicon(), true);
+
         for span in spans(&labels) {
+            let first_row = span.rows.start;
             let selected = &indices[span.rows];
+            let source_lines = || {
+                selected.chunk_by(|&left, &right| {
+                    !new_line(&layout.tokens[left], &layout.tokens[right])
+                })
+            };
+            let render_line = |token: usize| {
+                let range = layout.lines[layout.tokens[token].line_idx]
+                    .token_range
+                    .clone();
+                let indices: Vec<_> = range
+                    .filter(|&i| layout_visible(&layout.tokens[i]))
+                    .collect();
+                render(layout, &indices, self.lexicon(), false).text
+            };
             let text = render(layout, selected, self.lexicon(), false).text;
             let value = clean(&text);
             if span.tag != "<address>" && !affiliation.is_empty() {
-                let text = render(layout, &affiliation, self.lexicon(), true).text;
-                header.affiliations.extend(self.parse_affiliations_with(&text, scratch)?);
+                let text = crate::spans::render_affiliation(layout, &affiliation, self.lexicon());
+                header
+                    .affiliations
+                    .extend(self.parse_affiliations_with(&text, scratch)?);
                 affiliation.clear();
             }
             match span.tag {
                 "<title>" => {
-                    let cleaned = strip_crossmark(value);
-                    append(&mut header.title, clean(&cleaned));
+                    let stripped = strip_crossmark(value);
+                    let cleaned = clean_title(&stripped);
+                    let page = layout.tokens[selected[0]].page;
+                    if title_page.is_none_or(|first| first == page)
+                        && plausible_title(clean(cleaned))
+                    {
+                        title_page = Some(page);
+                        append(&mut header.title, clean(cleaned));
+                    }
                 }
                 "<author>" => {
                     let names = render_author_tokens(layout, selected, self.lexicon());
                     if !names.trim().is_empty() {
-                        header.authors.extend(self.parse_names(&names, ModelKind::NameHeader, scratch)?);
+                        let people = self.parse_names(&names, ModelKind::NameHeader, scratch)?;
+                        author_positions.extend(author_boxes(layout, selected, &people));
+                        header.authors.extend(people);
                     }
                 }
+                "<editor>" => {
+                    let names = EDITOR_LABEL.replace_all(value, "");
+                    header.editors.extend(self.parse_names(
+                        clean(&names),
+                        ModelKind::NameHeader,
+                        scratch,
+                    )?);
+                }
+                "<group>" if !value.is_empty() => header.authors.push(Person {
+                    organization: Some(value.to_owned()),
+                    ..Default::default()
+                }),
                 "<affiliation>" | "<address>" => affiliation.extend_from_slice(selected),
                 "<abstract>" => abstract_indices.extend_from_slice(selected),
-                "<keyword>" => header.keywords.extend(KEYWORDS.replace(value, "").split([',', ';', '·', '•'])
-                    .map(|term| clean(term).trim_end_matches('.')).filter(|term| !term.is_empty()).map(str::to_owned)),
-                "<date>" => header.dates.extend(self.parse_date_with(value, scratch)?),
+                "<keyword>" => header.keywords.extend(
+                    KEYWORDS
+                        .replace(value, "")
+                        .split([',', ';', '·', '•'])
+                        .map(|term| clean(term).trim_end_matches('.'))
+                        .filter(|term| !term.is_empty())
+                        .map(str::to_owned),
+                ),
+                "<date>" => {
+                    let mut row = first_row;
+                    for line in source_lines() {
+                        let start = raw.offsets[row].start;
+                        row += line.len();
+                        let end = raw.offsets[row - 1].end;
+                        if access_notice(&render_line(line[0])) {
+                            continue;
+                        }
+                        for (rank, value) in contextual_date_spans(&raw.text, start..end) {
+                            for date in self.parse_date_with(value, scratch)? {
+                                if date.year.is_some() {
+                                    date_candidates.push((rank, date.clone()));
+                                }
+                                header.dates.push(date);
+                            }
+                        }
+                    }
+                }
                 "<email>" => segmented_emails.extend(emails(value)),
                 "<copyright>" => append(&mut header.copyright, value),
                 "<funding>" => append(&mut header.funding_note, value),
                 "<submission>" => append(&mut header.submission_note, value),
-                "<meeting>" => append(&mut header.meeting, value),
-                "<reference>" => append(&mut header.note, value),
+                "<meeting>" | "<reference>"
+                    if plausible_venue(value)
+                        && source_lines().all(|line| plausible_venue(&render_line(line[0]))) =>
+                {
+                    if span.tag == "<meeting>" {
+                        append(&mut header.meeting, value);
+                    } else {
+                        venue_spans.push(value.to_owned());
+                    }
+                }
                 _ => {}
             }
         }
@@ -230,69 +403,208 @@ impl Engine {
             let trimmed = trim_abstract_column_bleed(layout, &abstract_indices);
             let raw_abs = render(layout, trimmed, self.lexicon(), false).text;
             let stripped = strip_crossmark(&ABSTRACT.replace(&raw_abs, ""));
-            append(&mut header.abstract_text, clean(&stripped));
+            if plausible_abstract(clean(&stripped)) {
+                append(&mut header.abstract_text, clean(&stripped));
+            }
         }
         if !affiliation.is_empty() {
-            let text = render(layout, &affiliation, self.lexicon(), true).text;
-            header.affiliations.extend(self.parse_affiliations_with(&text, scratch)?);
+            let text = crate::spans::render_affiliation(layout, &affiliation, self.lexicon());
+            header
+                .affiliations
+                .extend(self.parse_affiliations_with(&text, scratch)?);
         }
-        if header.title.is_none() {
-            header.title = recover_title_from_page1(layout, segments, self.lexicon())
-                .or_else(|| layout.metadata.title.as_deref().map(compact).filter(|s| !s.is_empty()));
+        let frontmatter = &segments.frontmatter;
+        let candidate_pages = || {
+            frontmatter
+                .candidates
+                .iter()
+                .filter_map(|number| layout.pages.iter().find(|page| page.number == *number))
+        };
+        header.title = header
+            .title
+            .filter(|title| plausible_title(title))
+            .or_else(|| {
+                candidate_pages().find_map(|page| {
+                    recover_title_from_page(layout, segments, page, self.lexicon())
+                        .filter(|title| plausible_title(title))
+                })
+            })
+            .or_else(|| {
+                [xmp(layout, "dc:title"), layout.metadata.title.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .map(compact)
+                    .map(|title| clean_title(&title).to_owned())
+                    .find(|title| plausible_title(title))
+            });
+        if let Some((title, editor_line)) = frontmatter.edited_title_page() {
+            let lower_title = title.to_lowercase();
+            if header
+                .title
+                .as_ref()
+                .is_none_or(|value| lower_title.contains(&value.to_lowercase()))
+            {
+                header.title = Some(title);
+            }
+            let editor_keys = email_key(editor_line);
+            let mut index = 0;
+            while index < header.authors.len() {
+                let key = email_key(&header.authors[index].full_name());
+                if !key.is_empty() && editor_keys.contains(&key) {
+                    header.editors.push(header.authors.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            if header.editors.is_empty() {
+                header.editors = self.parse_names(editor_line, ModelKind::NameHeader, scratch)?;
+            }
         }
-        let page1_text = page_text_for_identifiers(layout, 1, self.lexicon());
+        header.title = header.title.map(|title| {
+            let embedded = xmp(layout, "dc:title").or(layout.metadata.title.as_deref());
+            if let Some(embedded) =
+                embedded.filter(|embedded| repairs_uppercase_spacing(&title, embedded))
+            {
+                compact(embedded)
+            } else {
+                restore_tracked_title(title, |word| self.lexicon().in_dictionary(word))
+            }
+        });
         if header.abstract_text.is_none()
             && !header
                 .title
                 .as_deref()
-                .is_some_and(|t| t.to_ascii_lowercase().starts_with("author correction"))
-            && let Some(recovered) = recover_lead_abstract_from_page1(layout, segments, self.lexicon())
+                .is_some_and(|title| title.to_ascii_lowercase().starts_with("author correction"))
         {
-            append(&mut header.abstract_text, clean(&recovered));
+            // Unlabelled lead recovery is only safe on the selected title page.
+            header.abstract_text = candidate_pages().find_map(|page| {
+                recover_lead_abstract_from_page(
+                    layout,
+                    segments,
+                    page,
+                    self.lexicon(),
+                    Some(page.number) == frontmatter.primary(),
+                )
+                .filter(|text| plausible_abstract(text))
+            });
         }
         if header.authors.is_empty()
-            && page1_text
+            && frontmatter
+                .text(1)
                 .to_ascii_lowercase()
                 .contains("list of authors and their affiliations appears at the end")
             && let Some(names) = recover_end_of_paper_authors(layout, segments, self.lexicon())
         {
             header.authors = self.parse_names(&names, ModelKind::NameHeader, scratch)?;
         }
-        if header.authors.is_empty() && let Some(names) = &layout.metadata.author {
-            header.authors = self.parse_names(names, ModelKind::NameHeader, scratch)?;
-        }
-        dedup_authors(&mut header.authors);
-        let raw = render(layout, &indices, self.lexicon(), false).text;
-        header.doi = article_doi_from_links(&layout.links)
-            .or_else(|| doi(&raw))
-            .or_else(|| doi(&page1_text));
-        header.arxiv_id = capture(&ARXIV, &raw).or_else(|| capture(&ARXIV, &page1_text));
-        header.pmid = capture(&PMID, &raw).or_else(|| capture(&PMID, &page1_text));
-        header.pmcid = capture(&PMCID, &raw)
-            .or_else(|| capture(&PMCID, &page1_text))
-            .map(|value| value.to_ascii_uppercase());
-        header.issn = capture(&ISSN, &raw).or_else(|| capture(&ISSN, &page1_text));
-        header.eissn = capture(&EISSN, &raw).or_else(|| capture(&EISSN, &page1_text));
-        for url in urls(&raw) {
-            if !header.urls.iter().any(|u| u == url) {
-                header.urls.push(url.to_owned());
+        if header.authors.is_empty() && header.editors.is_empty() {
+            if let Some(creators) = layout.metadata.xmp.get("dc:creator") {
+                for name in creators
+                    .iter()
+                    .filter(|name| plausible_metadata_author(name))
+                {
+                    header.authors.push(Person {
+                        raw_name: Some(name.clone()),
+                        ..Default::default()
+                    });
+                }
+            }
+            if header.authors.is_empty()
+                && let Some(names) = &layout.metadata.author
+                && plausible_metadata_author(names)
+            {
+                header.authors = self.parse_names(names, ModelKind::NameHeader, scratch)?;
             }
         }
-        for email in emails(&raw).into_iter().chain(emails_from_links(&layout.links)) {
-            if !segmented_emails.iter().any(|e| e.eq_ignore_ascii_case(&email)) {
+        dedup_authors(&mut header.authors);
+        dedup_authors(&mut header.editors);
+        let mut links = layout
+            .links
+            .iter()
+            .filter(|link| link.page <= 8)
+            .cloned()
+            .collect::<Vec<_>>();
+        links.sort_by_key(|link| (Some(link.page) != frontmatter.primary(), link.page));
+        apply_identifiers(&mut header, layout, frontmatter, &links, &raw.text);
+        self.parse_header_venue(segments, &mut header, venue_spans, scratch)?;
+        header.meeting = header.meeting.take().filter(|text| plausible_venue(text));
+        apply_xmp_imprint(&mut header, layout);
+        header.journal = header.journal.take().filter(|text| plausible_venue(text));
+        for email in emails(&raw.text)
+            .into_iter()
+            .chain(emails_from_links(&links))
+        {
+            if !segmented_emails
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&email))
+            {
                 segmented_emails.push(email);
             }
         }
         if header.funding_note.is_none() {
-            let text = render(layout, &segments.indices(Zone::Funding), self.lexicon(), false).text;
+            let funding = segments
+                .indices(Zone::Funding)
+                .into_iter()
+                .filter(|&i| Some(layout.tokens[i].page) == frontmatter.primary())
+                .take(250)
+                .collect::<Vec<_>>();
+            let text = render(layout, &funding, self.lexicon(), false).text;
             append(&mut header.funding_note, &text);
         }
-        header.publication_date = header.dates.iter().find(|date| date.year.is_some()).cloned();
+        header.publication_date =
+            header_publication_date(&header, layout, frontmatter, date_candidates);
         set_affiliation_keys(&mut header.affiliations);
         link_affiliations(&mut header.authors, &header.affiliations);
+        link_affiliations(&mut header.editors, &header.affiliations);
         link_emails(&mut header.authors, &segmented_emails);
-        link_orcid_annotations(&mut header.authors, &orcids_from_links(&layout.links));
+        link_orcid_annotations(
+            &mut header.authors,
+            &author_positions,
+            &orcids_from_links(&links),
+        );
         Ok(header)
+    }
+
+    fn parse_header_venue(
+        &self,
+        segments: &Segmented<'_>,
+        header: &mut Header,
+        mut spans: Vec<String>,
+        scratch: &mut DecodeScratch,
+    ) -> Result<(), EngineError> {
+        if self.model_if_loaded(ModelKind::Citation).is_none() {
+            return Ok(());
+        }
+        let layout = segments.layout;
+        for page in layout
+            .pages
+            .iter()
+            .filter(|page| page.number == 1 || Some(page.number) == segments.frontmatter.primary())
+        {
+            let mut note = Vec::new();
+            for i in page.line_range.clone() {
+                if segments.zones[i] == Zone::Headnote {
+                    note.extend(
+                        layout.lines[i]
+                            .token_range
+                            .clone()
+                            .filter(|&i| layout_visible(&layout.tokens[i])),
+                    );
+                } else if !note.is_empty() {
+                    spans.push(render(layout, &note, self.lexicon(), false).text);
+                    note.clear();
+                }
+            }
+            if !note.is_empty() {
+                spans.push(render(layout, &note, self.lexicon(), false).text);
+            }
+        }
+        for venue in spans.iter().filter(|text| {
+            (8..=600).contains(&text.chars().count()) && !boilerplate(text) && plausible_venue(text)
+        }) {
+            apply_venue(header, self.parse_citation_with(venue, scratch)?);
+        }
+        Ok(())
     }
 
     fn references(&self, segments: &Segmented<'_>, scratch: &mut DecodeScratch) -> Result<Vec<BibItem>, EngineError> {
@@ -408,7 +720,7 @@ impl Engine {
     fn footnotes(&self, segments: &Segmented<'_>) -> Vec<Footnote> {
         let layout = segments.layout;
         let mut notes = Vec::new();
-        let mut indices = Vec::new();
+        let mut indices = Vec::<usize>::new();
         let mut previous_page = None;
         let push = |notes: &mut Vec<Footnote>, indices: &mut Vec<_>, page| {
             if !indices.is_empty() {
@@ -587,12 +899,19 @@ fn trim_abstract_column_bleed<'a>(layout: &LayoutDocument, indices: &'a [usize])
     indices
 }
 
-fn recover_lead_abstract_from_page1(
+fn recover_lead_abstract_from_page(
     layout: &LayoutDocument,
     segments: &Segmented<'_>,
+    page: &PageInfo,
     lexicon: &nosco_lexicon::Lexicon,
+    allow_unlabelled: bool,
 ) -> Option<String> {
-    let page = layout.pages.first()?;
+    if let Some(text) = explicit_abstract(layout, segments, page, lexicon) {
+        return Some(text);
+    }
+    if !allow_unlabelled {
+        return None;
+    }
     let dominant = layout.dominant_font_size().max(7.5);
     let mut best: Option<String> = None;
     for block in &layout.blocks[page.block_range.clone()] {
@@ -730,12 +1049,12 @@ fn recover_end_of_paper_authors(
     (!rendered.trim().is_empty()).then_some(rendered)
 }
 
-fn recover_title_from_page1(
+fn recover_title_from_page(
     layout: &LayoutDocument,
     segments: &Segmented<'_>,
+    page: &PageInfo,
     lexicon: &nosco_lexicon::Lexicon,
 ) -> Option<String> {
-    let page = layout.pages.first()?;
     let dominant = layout.dominant_font_size().max(9.0);
     let mut candidates: Vec<(usize, f64, String)> = Vec::new();
     for i in page.line_range.clone() {
@@ -764,7 +1083,10 @@ fn recover_title_from_page1(
         if trimmed.is_empty() {
             continue;
         }
-        if ABSTRACT.is_match(trimmed) || FIRST_SECTION.is_match(trimmed) {
+        if ABSTRACT.is_match(trimmed)
+            || FIRST_SECTION.is_match(trimmed)
+            || NUMBERED_SECTION.is_match(trimmed)
+        {
             break;
         }
         let lower = trimmed.to_ascii_lowercase();
@@ -779,7 +1101,10 @@ fn recover_title_from_page1(
         let mut sizes: Vec<f64> = toks.iter().map(|&j| layout.tokens[j].font_size).collect();
         sizes.sort_unstable_by(f64::total_cmp);
         let median_size = sizes[sizes.len() / 2];
-        candidates.push((i, median_size, trimmed.to_owned()));
+        let title = clean_title(trimmed);
+        if plausible_title(title) {
+            candidates.push((i, median_size, title.to_owned()));
+        }
     }
     let max_size = candidates
         .iter()
@@ -816,7 +1141,7 @@ fn page_text_for_identifiers(
     page_number: usize,
     lexicon: &nosco_lexicon::Lexicon,
 ) -> String {
-    let Some(page) = layout.pages.get(page_number.saturating_sub(1)) else {
+    let Some(page) = layout.pages.iter().find(|page| page.number == page_number) else {
         return String::new();
     };
     let indices: Vec<_> = page
@@ -825,6 +1150,47 @@ fn page_text_for_identifiers(
         .filter(|&i| layout.tokens.get(i).is_some_and(layout_visible))
         .collect();
     render(layout, &indices, lexicon, true).text
+}
+
+fn explicit_abstract(
+    layout: &LayoutDocument,
+    segments: &Segmented<'_>,
+    page: &PageInfo,
+    lexicon: &nosco_lexicon::Lexicon,
+) -> Option<String> {
+    let mut indices = Vec::<usize>::new();
+    let mut started = false;
+    for i in page.line_range.clone() {
+        if segments.furniture[i] || segments.badge[i] {
+            continue;
+        }
+        let line = &layout.lines[i];
+        let tokens: Vec<_> = line
+            .token_range
+            .clone()
+            .filter(|&i| layout_visible(&layout.tokens[i]))
+            .collect();
+        let text = render(layout, &tokens, lexicon, false).text;
+        if !started {
+            started = ABSTRACT.is_match(&text);
+        } else if KEYWORDS.is_match(&text)
+            || FIRST_SECTION.is_match(&text)
+            || segments.zones[i] == Zone::Toc
+            || (line.block_idx != layout.tokens[indices[0]].block_idx
+                && segments.zones[i] == Zone::Body)
+        {
+            break;
+        }
+        if started {
+            indices.extend(tokens);
+            if indices.len() > 650 {
+                return None;
+            }
+        }
+    }
+    let text = render(layout, &indices, lexicon, false).text;
+    let result = ABSTRACT.replace(&text, "");
+    plausible_abstract(clean(&result)).then(|| clean(&result).to_owned())
 }
 
 fn dedup_authors(authors: &mut Vec<Person>) {
@@ -893,22 +1259,67 @@ fn dedup_authors(authors: &mut Vec<Person>) {
     *authors = result;
 }
 
-fn link_orcid_annotations(authors: &mut [Person], orcids: &[(nosco_pdf::BoundingBox, String)]) {
-    if orcids.is_empty() || authors.is_empty() {
-        return;
-    }
-    let mut unique: Vec<String> = Vec::new();
-    for (_, id) in orcids {
-        if !unique.contains(id) {
-            unique.push(id.clone());
+fn link_orcid_annotations(
+    authors: &mut [Person],
+    positions: &[(String, BoundingBox)],
+    orcids: &[(BoundingBox, String)],
+) {
+    for (link, id) in orcids {
+        if authors
+            .iter()
+            .any(|person| person.orcid.as_ref() == Some(id))
+        {
+            continue;
+        }
+        let nearest = positions
+            .iter()
+            .filter_map(|(name, bbox)| {
+                if bbox.page != link.page {
+                    return None;
+                }
+                let dx = (bbox.x - link.x2()).max(link.x - bbox.x2()).max(0.0);
+                let dy = ((bbox.y + bbox.y2()) - (link.y + link.y2())).abs() / 2.0;
+                (dx <= 48.0 && dy <= bbox.height.max(link.height) * 0.8)
+                    .then_some((name, dx + 3.0 * dy))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some((name, _)) = nearest
+            && let Some(author) = authors
+                .iter_mut()
+                .find(|person| person.full_name() == *name && person.orcid.is_none())
+        {
+            author.orcid = Some(id.clone());
         }
     }
-    let missing: Vec<_> = authors.iter_mut().filter(|a| a.orcid.is_none()).collect();
-    if missing.len() == unique.len() {
-        for (author, orcid) in missing.into_iter().zip(unique) {
-            author.orcid = Some(orcid);
+}
+
+fn author_boxes(
+    layout: &LayoutDocument,
+    indices: &[usize],
+    people: &[Person],
+) -> Vec<(String, BoundingBox)> {
+    let mut tokens = indices.iter().map(|&i| &layout.tokens[i]);
+    let mut positions = Vec::new();
+    for person in people {
+        let Some(last) = person
+            .last_name
+            .as_deref()
+            .and_then(|name| name.split_whitespace().last())
+        else {
+            continue;
+        };
+        let mut search = tokens.clone();
+        if let Some(token) = search.find(|token| {
+            token
+                .text
+                .trim_matches(|ch: char| !ch.is_alphabetic())
+                .eq_ignore_ascii_case(last)
+        }) {
+            positions.push((person.full_name(), token.bbox));
+            tokens = search;
         }
     }
+    positions
 }
 
 fn render_author_tokens(layout: &LayoutDocument, selected: &[usize], lexicon: &nosco_lexicon::Lexicon) -> String {
@@ -1043,13 +1454,522 @@ fn link_emails(authors: &mut [Person], emails: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text::year;
+    use nosco_models::Date;
+
+    fn page_layout(contents: &[&[&str]]) -> LayoutDocument {
+        let mut layout = LayoutDocument::default();
+        for (index, lines) in contents.iter().enumerate() {
+            let page = index + 1;
+            let line_start = layout.lines.len();
+            let start = layout.tokens.len();
+            let bbox = BoundingBox::new(page, 0., 0., 400., 600.);
+            for text in *lines {
+                let index = layout.tokens.len();
+                let mut token = crate::spans::tests::test_token(text);
+                token.page = page;
+                token.line_idx = layout.lines.len();
+                layout.tokens.push(token);
+                layout.lines.push(nosco_pdf::LayoutLine {
+                    page,
+                    bbox,
+                    token_range: index..index + 1,
+                    block_idx: 0,
+                });
+            }
+            layout.pages.push(PageInfo {
+                number: page,
+                width: 400.,
+                height: 600.,
+                main_area: bbox,
+                block_range: 0..0,
+                line_range: line_start..layout.lines.len(),
+                token_range: start..layout.tokens.len(),
+            });
+        }
+        layout
+    }
+
+    #[test]
+    fn excludes_repository_cover_but_keeps_its_identifiers() {
+        let layout = page_layout(&[
+            &[
+                "Author(s): Example",
+                "Source: Example Journal",
+                "Stable URL: https://jstor.org/stable/1234",
+            ],
+            &[
+                "The actual article title",
+                "Example Author",
+                "Abstract: The article begins here.",
+            ],
+            &["HAL Id: hal-00000001", "Submitted on 2 January 2020"],
+            &[
+                "All rights reserved",
+                "Copyright 2001",
+                "ISBN 978-0-387-32458-6",
+            ],
+        ]);
+        let frontmatter = Frontmatter::detect(&layout, &[Zone::Header; 11], &Default::default());
+        assert_eq!(frontmatter.primary(), Some(2));
+        assert!(repository_cover(frontmatter.text(3)));
+        assert!(frontmatter.excluded.contains(&4));
+        let mut header = Header::default();
+        apply_identifiers(&mut header, &layout, &frontmatter, &[], "");
+        assert_eq!(header.urls, ["https://jstor.org/stable/1234"]);
+        assert_eq!(header.isbn.as_deref(), Some("9780387324586"));
+        assert_eq!(
+            copyright_date(frontmatter.ordered_text()).unwrap().year,
+            Some(2001)
+        );
+    }
+
+    #[test]
+    fn skips_book_half_title_and_bounds_header_lines() {
+        let layout = page_layout(&[
+            &["A handbook"],
+            &[
+                "A handbook",
+                "Edited by Some Person",
+                "Running head",
+                "Body starts",
+                "Stray header",
+            ],
+            &["Contents", "Unrelated chapter title"],
+            &["Copyright 2001", "ISBN 978-0-387-32458-6"],
+        ]);
+        let zones = vec![
+            Zone::Header,
+            Zone::Header,
+            Zone::Header,
+            Zone::Header,
+            Zone::Body,
+            Zone::Header,
+            Zone::Toc,
+            Zone::Toc,
+            Zone::Other,
+            Zone::Other,
+        ];
+        let frontmatter = Frontmatter::detect(&layout, &zones, &Default::default());
+        assert_eq!(frontmatter.primary(), Some(2));
+        let mut furniture = vec![false; zones.len()];
+        furniture[3] = true;
+        let segments = Segmented {
+            layout: &layout,
+            starts: vec![false; zones.len()],
+            badge: vec![false; zones.len()],
+            zones,
+            furniture,
+            frontmatter,
+            lead_override: Vec::new(),
+        };
+        assert_eq!(segments.header_indices(), [1, 2]);
+        assert!(!segments.indices(Zone::Header).contains(&3));
+    }
+
+    #[test]
+    fn bounds_header_by_token_limit_page_window_and_toc() {
+        let lexicon = Default::default();
+        let long_page = vec!["word"; HEADER_TOKEN_LIMIT + 4];
+        let layout = page_layout(&[&long_page, &["lead"], &["lead"], &["late"]]);
+        let zones = vec![Zone::Header; layout.lines.len()];
+        let mut segments = Segmented {
+            layout: &layout,
+            starts: vec![false; zones.len()],
+            furniture: vec![false; zones.len()],
+            badge: vec![false; zones.len()],
+            frontmatter: Frontmatter::detect(&layout, &zones, &lexicon),
+            zones,
+            lead_override: Vec::new(),
+        };
+        assert_eq!(segments.header_indices().len(), HEADER_TOKEN_LIMIT);
+        segments.furniture[..long_page.len() - 1].fill(true);
+        assert_eq!(segments.header_indices().len(), 3);
+        segments.zones[long_page.len()] = Zone::Toc;
+        assert_eq!(segments.header_indices().len(), 1);
+    }
+
+    #[test]
+    fn rejects_boilerplate_titles_and_abstracts() {
+        for title in [
+            "Microsoft Word - title.docx",
+            "PII: 244329",
+            "Untitled",
+            "Layout 1",
+            "chapter.pdf",
+            "Chapter one. Another heading. A third title. Some more headings. Another chapter",
+        ] {
+            assert!(!plausible_title(title), "{title}");
+        }
+        assert!(plausible_title("The science of social movements"));
+        for text in [
+            "All rights reserved. This material may not be translated or copied.",
+            "Downloaded from an archive. Terms of use apply.",
+            "), except for brief excerpts when referenced in a review",
+        ] {
+            assert!(!plausible_abstract(text), "{text}");
+        }
+        assert!(plausible_abstract(
+            "We analyse the history of social movement theories."
+        ));
+    }
+
+    #[test]
+    fn rejects_section_headings_and_series_banners_as_titles() {
+        for text in [
+            "2. Background",
+            "2. Method",
+            "3. Specializing Multi-Step Reasoning",
+            "3.1 Related Work",
+            "4.2.1. Conclusions",
+            "DISCUSSION PAPER SERIES",
+            "WORKING PAPER SERIES",
+            "NBER WORKING PAPER SERIES",
+            "Working Paper Number 42",
+            "IAB-KURZBERICHT",
+            "This page intentionally left blank",
+            "Online Appendix",
+            "Supplementary Material",
+        ] {
+            assert!(!plausible_title(text), "{text}");
+        }
+        for prefix in [
+            "NBER WORKING PAPER SERIES",
+            "IZA DISCUSSION PAPER SERIES",
+            "DISCUSSION PAPER SERIES",
+        ] {
+            assert_eq!(
+                clean_title(&format!("{prefix} An Actual Paper")),
+                "An Actual Paper"
+            );
+        }
+        let tracked = "G LO B A L I N E Q UA L I T Y";
+        assert_eq!(
+            restore_tracked_title(tracked.into(), |word| matches!(
+                word,
+                "GLOBAL" | "INEQUALITY" | "EQUALITY"
+            )),
+            "GLOBAL INEQUALITY"
+        );
+        assert_eq!(restore_tracked_title(tracked.into(), |_| false), tracked);
+        assert!(repairs_uppercase_spacing(
+            "GLOBAL IN EQUALITY",
+            "Global Inequality"
+        ));
+        assert!(!repairs_uppercase_spacing(
+            "GLOBAL ECONOMY",
+            "Global Inequality"
+        ));
+        assert_eq!(
+            restore_tracked_title("THE US IN AN EU AI LAW".into(), |_| true),
+            "THE US IN AN EU AI LAW"
+        );
+    }
+
+    #[test]
+    fn access_notices_do_not_supply_publication_dates() {
+        for marker in [
+            "Accessed:",
+            "Downloaded",
+            "Téléchargé",
+            "Retrieved",
+            "Printed",
+            "Stable URL",
+            "All content following this page",
+            "Scholars Portal",
+        ] {
+            let before = format!("{marker} 2016");
+            assert!(
+                contextual_date_spans(&before, before.len() - 4..before.len()).is_empty(),
+                "{before}"
+            );
+            let after = format!("2016 {marker}");
+            assert!(contextual_date_spans(&after, 0..4).is_empty(), "{after}");
+        }
+
+        let mut layout = LayoutDocument::default();
+        layout.metadata.creation_date = Some("D:20160901000000".into());
+        layout
+            .metadata
+            .xmp
+            .insert("xmp:CreateDate".into(), vec!["2016-09-01".into()]);
+        for notice in [
+            "JSTOR is a not-for-profit",
+            "Stable URL: https://www.jstor.org/stable/123",
+            "Downloaded from Cambridge Core",
+            "Downloaded from ProQuest",
+            "Downloaded from EBSCO",
+            "All content following this page was uploaded to ResearchGate",
+            "Scholars Portal Books",
+        ] {
+            let cover = page_layout(&[&[notice]]);
+            let frontmatter = Frontmatter::detect(&cover, &[Zone::Header], &Default::default());
+            assert!(
+                header_publication_date(&Header::default(), &layout, &frontmatter, vec![])
+                    .is_none(),
+                "{notice}"
+            );
+            let book = page_layout(&[&[notice], &["Copyright © 1984"]]);
+            let frontmatter = Frontmatter::detect(&book, &[Zone::Header; 2], &Default::default());
+            assert_eq!(
+                header_publication_date(&Header::default(), &layout, &frontmatter, vec![])
+                    .unwrap()
+                    .year,
+                Some(1984)
+            );
+        }
+    }
+
+    #[test]
+    fn reads_jstor_source_year_without_using_download_year() {
+        let cover = page_layout(&[&[
+            "Source: Comparative Politics, Jan., 1981, Vol. 13",
+            "Stable URL: https://www.jstor.org/stable/421620",
+            "Accessed: 2016-08-07",
+        ]]);
+        let frontmatter = Frontmatter::detect(&cover, &[Zone::Headnote; 3], &Default::default());
+        assert_eq!(
+            header_publication_date(&Header::default(), &cover, &frontmatter, vec![])
+                .unwrap()
+                .year,
+            Some(1981)
+        );
+    }
+
+    #[test]
+    fn filters_venue_watermarks_and_recovers_conference_year() {
+        for text in [
+            "Portal Books on 2026-11-09 Téléchargé de Scholars Portal Books sur 2026-11-09",
+            "OCT 2 5 1999 LIBRARIES A RISK-ADJUSTED PERFORMANCE HISTORY",
+            "https://example.org",
+            "http://example.org",
+            "Stable URL",
+            "Accessed in 2016",
+            "All rights reserved",
+            "Copyright 1981",
+        ] {
+            assert!(!plausible_venue(text), "{text}");
+            let mut header = Header::default();
+            apply_venue(
+                &mut header,
+                BibItem {
+                    journal: Some(text.into()),
+                    ..Default::default()
+                },
+            );
+            assert!(header.journal.is_none());
+        }
+        let header = Header {
+            meeting: Some("July 10–12, 2023 • Boston, MA, USA".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            header_publication_date(
+                &header,
+                &Default::default(),
+                &Frontmatter::default(),
+                vec![]
+            )
+            .unwrap()
+            .year,
+            Some(2023)
+        );
+    }
+
+    #[test]
+    fn publication_dates_prefer_publication_context_and_plausible_years() {
+        let text = "Received 1999; Revised 2000; Published online: 2001\nDownloaded 2026";
+        let ranges = contextual_date_spans(text, 0..text.len());
+        let dates = ranges
+            .into_iter()
+            .filter_map(|(rank, text)| {
+                Some((
+                    rank,
+                    Date {
+                        year: Some(year(YEAR.find(text)?.as_str())?),
+                        ..Default::default()
+                    },
+                ))
+            })
+            .collect();
+        assert_eq!(select_publication_date(dates).unwrap().year, Some(2001));
+        assert_eq!(
+            contextual_date_spans("Accepted: 2020", 10..14),
+            [(0, "2020")]
+        );
+        assert_eq!(year("0406"), None);
+        assert_eq!(year("2099"), None);
+        assert_eq!(arxiv_date("hep-th/9901001").unwrap().year, Some(1999));
+        assert_eq!(arxiv_date("2301.12345").unwrap().month, Some(1));
+    }
+
+    #[test]
+    fn parses_reference_and_multiline_headnote_with_citation_model() {
+        let Some(models) = std::env::var_os("NOSCO_MODELS") else {
+            eprintln!("skipping citation model test: set NOSCO_MODELS to a compact pack");
+            return;
+        };
+        let engine = Engine::load_for_header(Path::new(&models)).unwrap();
+        for kind in [
+            ModelKind::Fulltext,
+            ModelKind::Figure,
+            ModelKind::Table,
+            ModelKind::ReferenceSegmenter,
+        ] {
+            assert!(engine.model_if_loaded(kind).is_none());
+        }
+        assert!(engine.model_if_loaded(ModelKind::Citation).is_some());
+        let layout = page_layout(&[&[
+            "Journal of Biological Chemistry, 2020",
+            "Vol. 295, No. 20, pp. 6501–6509",
+        ]]);
+        let mut segments = Segmented {
+            layout: &layout,
+            starts: vec![false; 2],
+            badge: vec![false; 2],
+            furniture: vec![true; 2],
+            zones: vec![Zone::Headnote; 2],
+            frontmatter: Frontmatter::default(),
+            lead_override: Vec::new(),
+        };
+        let mut header = Header::default();
+        let mut scratch = DecodeScratch::new();
+        engine
+            .parse_header_venue(&segments, &mut header, vec![], &mut scratch)
+            .unwrap();
+        assert_eq!(
+            header.journal.as_deref(),
+            Some("Journal of Biological Chemistry")
+        );
+        assert_eq!(header.volume.as_deref(), Some("295"));
+        assert_eq!(header.issue.as_deref(), Some("20"));
+        assert_eq!(header.pages.as_deref(), Some("6501–6509"));
+        assert_eq!(header.publication_date.unwrap().year, Some(2020));
+
+        segments.zones.fill(Zone::Header);
+        let mut header = Header::default();
+        engine
+            .parse_header_venue(
+                &segments,
+                &mut header,
+                vec![
+                    "Nature Communications (2024) 15:1234".into(),
+                    "bibliography ".repeat(601),
+                ],
+                &mut scratch,
+            )
+            .unwrap();
+        assert_eq!(header.journal.as_deref(), Some("Nature Communications"));
+        assert_eq!(header.volume.as_deref(), Some("15"));
+        assert_eq!(header.pages.as_deref(), Some("1234"));
+        assert!(header.note.is_none());
+    }
+
+    #[test]
+    fn venue_and_xmp_supply_imprint_fields() {
+        let mut header = Header::default();
+        apply_venue(
+            &mut header,
+            BibItem {
+                journal: Some("Journal of Examples".to_owned()),
+                volume: Some("40".to_owned()),
+                issue: Some("2".to_owned()),
+                page_range: Some("33-40".to_owned()),
+                publisher: Some("Academic Press".to_owned()),
+                location: Some("Oxford".to_owned()),
+                date: Some(Date {
+                    year: Some(2001),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(header.journal.as_deref(), Some("Journal of Examples"));
+        assert_eq!(header.volume.as_deref(), Some("40"));
+        assert_eq!(header.issue.as_deref(), Some("2"));
+        assert_eq!(header.pages.as_deref(), Some("33-40"));
+        assert_eq!(header.publisher.as_deref(), Some("Academic Press"));
+        assert_eq!(header.location.as_deref(), Some("Oxford"));
+        assert_eq!(header.publication_date.unwrap().year, Some(2001));
+        let mut layout = LayoutDocument::default();
+        layout
+            .metadata
+            .xmp
+            .insert("prism:coverDate".into(), vec!["1999-07-01".into()]);
+        assert_eq!(
+            embedded_date(&layout, &["prism:coverDate"]).unwrap().month,
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn structured_identifiers_override_weak_frontmatter_matches() {
+        let mut layout = page_layout(&[&["DOI: 10.1000/earlier123", "ISSN 1998-2001"]]);
+        for (key, value) in [
+            ("prism:doi", "10.48550/arXiv.2301.12345"),
+            ("prism:eIssn", "2041-1723"),
+            ("prism:isbn", "978-0-387-32458-6"),
+        ] {
+            layout.metadata.xmp.insert(key.into(), vec![value.into()]);
+        }
+        let frontmatter = Frontmatter::detect(&layout, &[Zone::Header; 2], &Default::default());
+        let mut header = Header::default();
+        apply_identifiers(&mut header, &layout, &frontmatter, &[], "");
+        assert_eq!(header.doi.as_deref(), Some("10.48550/arXiv.2301.12345"));
+        assert_eq!(header.arxiv_id.as_deref(), Some("2301.12345"));
+        assert_eq!(header.eissn.as_deref(), Some("2041-1723"));
+        assert!(header.issn.is_none());
+        assert_eq!(header.isbn.as_deref(), Some("9780387324586"));
+    }
+
+    #[test]
+    fn sparse_orcid_annotations_match_the_nearby_author() {
+        let mut authors = [
+            Person {
+                last_name: Some("First".into()),
+                ..Default::default()
+            },
+            Person {
+                last_name: Some("Second".into()),
+                ..Default::default()
+            },
+        ];
+        let boxes = [
+            ("First".into(), BoundingBox::new(2, 30., 90., 20., 10.)),
+            ("Second".into(), BoundingBox::new(2, 80., 90., 25., 10.)),
+        ];
+        link_orcid_annotations(
+            &mut authors,
+            &boxes,
+            &[(
+                BoundingBox::new(2, 108., 90., 8., 8.),
+                "0000-0002-1825-0097".into(),
+            )],
+        );
+        assert_eq!(authors[0].orcid, None);
+        assert_eq!(authors[1].orcid.as_deref(), Some("0000-0002-1825-0097"));
+    }
 
     #[test]
     fn links_normalized_markers_and_single_unmarked_affiliation() {
-        let mut authors = [Person { affiliation_markers: vec!["[¹], A, ∗".into()], ..Default::default() }, Person::default()];
+        let mut authors = [
+            Person {
+                affiliation_markers: vec!["[¹], A, ∗".into()],
+                ..Default::default()
+            },
+            Person::default(),
+        ];
         let mut affiliations = [
-            Affiliation { key: Some("aff0".into()), marker: Some("1".into()), ..Default::default() },
-            Affiliation { key: Some("aff1".into()), marker: Some("(a)*".into()), ..Default::default() },
+            Affiliation {
+                key: Some("aff0".into()),
+                marker: Some("1".into()),
+                ..Default::default()
+            },
+            Affiliation {
+                key: Some("aff1".into()),
+                marker: Some("(a)*".into()),
+                ..Default::default()
+            },
         ];
         link_affiliations(&mut authors, &affiliations);
         assert_eq!(authors[0].affiliation_keys, ["aff0", "aff1"]);
