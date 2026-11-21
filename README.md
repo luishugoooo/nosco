@@ -60,6 +60,14 @@ let tei = doc.to_tei_xml(&TeiOptions::default())?;
 | Publisher DOIs | 50/50 | 45/50 |
 | References | 7,155 | 7,098 |
 
+## Why It's Fast
+
+- **Single-process pipeline** — PDF parsing, layout analysis, feature extraction, and CRF decoding run in memory without spawning `pdfalto`, writing intermediate XML to disk, or crossing JVM/JNI boundaries.
+- **Compacted binary models & lexicons** — `nosco setup` strips L1-zeroed observations from upstream Wapiti text models (182.2 MiB → 2.99 MiB `.gcrf`) and packs lexicons into a flat-arena `.glex` binary trie, avoiding startup decompression and text parsing.
+- **Flat memory layout & scratch reuse** — tokens, trie nodes, and CRF weights live in contiguous arrays without per-object JVM/GC overhead, and workers reuse a single `DecodeScratch` buffer across sequences and documents.
+- **No raster image decoding** — `nosco-pdf` keeps image bounding boxes for layout and figure detection and discards raw image stream bytes immediately.
+- **Shared read-only weights** — immutable models and lexicons are shared (`Send + Sync`) across Rayon threads for both multi-PDF batches and parallel citation parsing.
+
 ## Crates
 
 - `nosco-crf` — Wapiti-compatible linear-chain CRF decoder and `.gcrf` binary format
