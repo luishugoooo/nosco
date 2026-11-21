@@ -2,7 +2,7 @@
 
 # nosco
 
-Pure-Rust scholarly PDF and bibliographic extraction engine compatible with [GROBID](https://github.com/grobidOrg/grobid) 0.9.1 CRF models. Runs locally as a CLI or library with no JVM, C/C++ runtime, or `pdfalto` subprocess.
+Pure-Rust scholarly PDF and bibliographic extraction engine compatible with [GROBID](https://github.com/grobidOrg/grobid) 0.9.1 CRF models. Compared to upstream `grobid/grobid:0.9.1-crf`, it runs ~13× faster (8.4 vs. 0.66 PDF/s) with ~13× less RAM (410 MiB vs. 5.2 GiB) and a 42 ms cold start (vs. 30 s) by running PDF layout, feature extraction, and compact binary CRF models (~61× smaller) in a single native process with no JVM, `pdfalto` subprocess, or JNI/XML round-trips.
 
 ## Usage
 
