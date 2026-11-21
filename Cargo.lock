@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "nosco-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "nosco-crf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "memmap2",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "nosco-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "nosco-crf",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "nosco-features"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nosco-lexicon",
  "nosco-pdf",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "nosco-lexicon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "quick-xml",
  "regex",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "nosco-models"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "quick-xml",
  "serde",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "nosco-pdf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "lopdf",
