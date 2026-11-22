@@ -2,11 +2,15 @@
 
 # nosco
 
-Pure-Rust scholarly PDF and bibliographic extraction engine compatible with [GROBID](https://github.com/grobidOrg/grobid) 0.9.1 CRF models. Compared to upstream `grobid/grobid:0.9.1-crf`, it runs ~13× faster (8.4 vs. 0.66 PDF/s) with ~13× less RAM (410 MiB vs. 5.2 GiB) and a 42 ms cold start (vs. 30 s) by running PDF layout, feature extraction, and compact binary CRF models (~61× smaller) in a single native process with no JVM, `pdfalto` subprocess, or JNI/XML round-trips.
+Pure-Rust scholarly PDF and bibliographic extraction engine compatible with [GROBID](https://github.com/grobidOrg/grobid) 0.9.1 CRF models. It runs the full pipeline in one native process and processes PDFs about 10× as fast as upstream GROBID in the benchmark below.
+
+v0.2.0 improves header extraction with embedded PDF metadata fallbacks, adds support for editors, organizational authors, and ISBNs, and speeds up PDF processing. Header-only mode loads only the models it needs.
 
 ## Usage
 
-Build and convert an upstream `grobid-home` directory into a compact binary asset pack (`.gcrf` models + `.glex` lexicons, ~19.8 MiB):
+Download and unpack a [release binary and the GROBID 0.9.1 model pack](https://github.com/luishugoooo/nosco/releases/latest). Run the binary with `--models` pointing to the unpacked model directory.
+
+To build from source and convert an upstream `grobid-home` into a compact model pack:
 
 ```bash
 cargo build --release -p nosco-cli
@@ -46,19 +50,21 @@ let tei = doc.to_tei_xml(&TeiOptions::default())?;
 
 ## Benchmark
 
-140 scholarly PDFs (3,146 pages; arXiv, Nature OA, PLOS, BMC/Springer, OpenAlex), 4 CPU cores, no consolidation:
+Full-text extraction on 140 scholarly PDFs (3,146 pages; arXiv, Nature OA, PLOS, BMC/Springer, OpenAlex), with four workers on an AMD EPYC Rome VM and consolidation disabled. Extraction scores and reference counts use the 139 PDFs with valid reference metadata.
 
-| Metric | `nosco` | `grobid/grobid:0.9.1-crf` |
+| Metric | `nosco` v0.2.0 | `grobid/grobid:0.9.1-crf` |
 | :--- | ---: | ---: |
-| Cold start | 41.7 ms | 30.2 s |
-| Wall time | 16.6 s (8.4 PDF/s) | 212.3 s (0.66 PDF/s) |
-| Median / p95 latency | 360 ms / 1.34 s | 4.21 s / 13.51 s |
-| Peak RSS | 410.5 MiB | 5,158.9 MiB |
-| Title mean sim (blank) | 98.3% (0) | 96.9% (2) |
-| Author F1 | 93.2% | 94.5% |
-| Abstract F1 | 89.8% | 86.5% |
+| Startup | 315 ms | 38.6 s |
+| Wall time | 18.7 s (7.49 PDF/s) | 194.5 s (0.72 PDF/s) |
+| Median / p95 latency | 403 ms / 1.42 s | 3.83 s / 12.60 s |
+| Peak memory | 346.0 MiB | 5,464.1 MiB |
+| Title mean similarity (blank) | 98.0% (1) | 96.9% (2) |
+| Author F1 | 92.8% | 94.5% |
+| Abstract F1 | 89.6% | 86.5% |
 | Publisher DOIs | 50/50 | 45/50 |
-| References | 7,155 | 7,098 |
+| References | 7,115 | 7,098 |
+
+Startup measures nosco model load and GROBID container readiness. Memory measures nosco process peak RSS and GROBID peak sampled container usage.
 
 ## Why It's Fast
 
