@@ -119,31 +119,62 @@ fn is_numeric_citation_list(text: &str) -> bool {
         })
 }
 
-fn split_delimited_callout(callout: &Callout, delim: char) -> Vec<Callout> {
+fn split_callout(
+    callout: &Callout,
+    delimiters: impl Iterator<Item = (usize, usize)>,
+) -> Vec<Callout> {
+    let mut start = 0;
     let mut parts = Vec::new();
-    let base = callout.char_start;
-    let mut cursor = 0;
-    for segment in callout.text.split(delim) {
-        let seg_start = cursor;
-        cursor += segment.len() + delim.len_utf8();
-        let trimmed = segment.trim_matches(|c: char| {
+    for (end, next) in delimiters.chain(std::iter::once((callout.text.len(), callout.text.len()))) {
+        let segment = &callout.text[start..end];
+        let text = segment.trim_matches(|c: char| {
             c.is_whitespace() || matches!(c, '(' | ')' | '[' | ']' | ';' | ',')
         });
-        if trimmed.is_empty() {
-            continue;
+        if let Some(offset) = segment.find(text).filter(|_| !text.is_empty()) {
+            let char_start = callout.char_start + start + offset;
+            parts.push(Callout {
+                kind: callout.kind,
+                text: text.to_owned(),
+                target_id: None,
+                char_start,
+                char_end: char_start + text.len(),
+            });
         }
-        let inner_offset = segment.find(trimmed).unwrap_or(0);
-        let start = base + seg_start + inner_offset;
-        let end = start + trimmed.len();
-        parts.push(Callout {
-            kind: callout.kind,
-            text: trimmed.to_owned(),
-            target_id: None,
-            char_start: start,
-            char_end: end,
-        });
+        start = next;
     }
     parts
+}
+
+fn split_bibliography_callout(callout: &Callout) -> Vec<Callout> {
+    static YEAR_AT_END: OnceLock<Regex> = OnceLock::new();
+    static AUTHOR_AT_START: OnceLock<Regex> = OnceLock::new();
+    let year_at_end = YEAR_AT_END.get_or_init(|| {
+        Regex::new(r"\b(?:18|19|20)\d{2}[a-z]?(?:\s*:\s*\d+(?:[-–]\d+)?)?\s*\)?\s*$")
+            .expect("valid regex")
+    });
+    let author_at_start = AUTHOR_AT_START.get_or_init(|| {
+        Regex::new(
+            r"^\s*(?:(?:and|or)\s+)?\p{Lu}[\p{L}\p{M}\s.,&'’\-–]*\(?\b(?:18|19|20)\d{2}[a-z]?\b",
+        )
+        .expect("valid regex")
+    });
+    let text = &callout.text;
+    let numeric = is_numeric_citation_list(text);
+    let mut delimiters = text
+        .match_indices([',', ';'])
+        .filter_map(|(offset, delimiter)| {
+            let next = offset + delimiter.len();
+            (delimiter == ";"
+                || numeric
+                || (year_at_end.is_match(&text[..offset])
+                    && author_at_start.is_match(&text[next..])))
+            .then_some((offset, next))
+        })
+        .peekable();
+    if delimiters.peek().is_none() {
+        return Vec::new();
+    }
+    split_callout(callout, delimiters)
 }
 
 fn resolve_sections(sections: &mut [Section], ctx: &ResolveCtx<'_>) {
@@ -160,24 +191,13 @@ fn resolve_sections(sections: &mut [Section], ctx: &ResolveCtx<'_>) {
                         callout.kind = CalloutKind::Bibr;
                     }
                     if callout.kind == CalloutKind::Bibr {
-                        let delim = if callout.text.contains(';') {
-                            Some(';')
-                        } else if is_numeric_citation_list(&callout.text) {
-                            Some(',')
-                        } else {
-                            None
-                        };
-                        if let Some(delim) = delim {
-                            let sub = split_delimited_callout(&callout, delim);
-                            if sub.len() > 1 {
-                                for mut piece in sub {
-                                    if piece.target_id.is_none() {
-                                        piece.target_id = resolve_callout(&piece, ctx);
-                                    }
-                                    expanded.push(piece);
-                                }
-                                continue;
+                        let pieces = split_bibliography_callout(&callout);
+                        if pieces.len() > 1 {
+                            for mut piece in pieces {
+                                piece.target_id = resolve_callout(&piece, ctx);
+                                expanded.push(piece);
                             }
+                            continue;
                         }
                     }
                     if callout.target_id.is_none() {
@@ -642,5 +662,62 @@ mod tests {
         assert_eq!(p.callouts[1].target_id.as_deref(), Some("b1"));
         assert_eq!(p.callouts[2].kind, CalloutKind::Bibr);
         assert_eq!(p.callouts[2].target_id.as_deref(), Some("b0"));
+    }
+
+    #[test]
+    fn splits_comma_separated_author_year_callouts_with_byte_offsets() {
+        let text = "Déjà vu (Müller et al., 2019:12–14, Smith & Lee, 2020a; Öberg 2021)";
+        let start = text.find('(').unwrap();
+        let mut doc = Document {
+            references: [("Müller", 2019), ("Smith", 2020), ("Öberg", 2021)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (name, year))| BibItem {
+                    id: Some(format!("b{index}")),
+                    authors: vec![Person {
+                        last_name: Some(name.into()),
+                        ..Default::default()
+                    }],
+                    date: Some(Date {
+                        year: Some(year),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+            body: vec![Section {
+                elements: vec![BodyElement::Paragraph(Paragraph {
+                    text: text.into(),
+                    callouts: vec![Callout {
+                        kind: CalloutKind::Bibr,
+                        text: text[start..].into(),
+                        char_start: start,
+                        char_end: text.len(),
+                        target_id: None,
+                    }],
+                    bboxes: Vec::new(),
+                })],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        resolve(&mut doc);
+
+        let BodyElement::Paragraph(paragraph) = &doc.body[0].elements[0] else {
+            panic!("expected paragraph");
+        };
+        let expected = [
+            "Müller et al., 2019:12–14",
+            "Smith & Lee, 2020a",
+            "Öberg 2021",
+        ];
+        assert_eq!(paragraph.callouts.len(), expected.len());
+        for (index, (callout, expected_text)) in paragraph.callouts.iter().zip(expected).enumerate()
+        {
+            assert_eq!(callout.text, expected_text);
+            assert_eq!(&text[callout.char_start..callout.char_end], expected_text);
+            assert_eq!(callout.target_id, Some(format!("b{index}")));
+        }
     }
 }
