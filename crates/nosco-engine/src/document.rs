@@ -667,11 +667,30 @@ impl Engine {
         let mut links = layout
             .links
             .iter()
-            .filter(|link| link.page <= 8)
+            .filter(|link| link.page <= 8 && !frontmatter.withdrawal_notices.contains(&link.page))
             .cloned()
             .collect::<Vec<_>>();
         links.sort_by_key(|link| (Some(link.page) != frontmatter.primary(), link.page));
         apply_identifiers(&mut header, layout, frontmatter, &links, &raw.text);
+        if let Some((number, title)) = frontmatter
+            .primary()
+            .and_then(|page| rfc_frontmatter(frontmatter.text(page)))
+        {
+            let title = repair(title);
+            if !title.is_empty() {
+                header.title = Some(title);
+            }
+            header.doi = Some(format!("10.17487/RFC{number}"));
+        }
+        if let Some(doi) = &header.doi
+            && let Some(title) = embedded_titles().find_map(|title| {
+                frontmatter
+                    .nist_report_pages(doi)
+                    .find_map(|page| nist_report_title(&title, page))
+            })
+        {
+            header.title = Some(title);
+        }
         if frontmatter.book_metadata.is_none() {
             self.parse_header_venue(segments, &mut header, venue_spans, scratch)?;
         }
@@ -743,11 +762,13 @@ impl Engine {
             return Ok(());
         }
         let layout = segments.layout;
-        for page in layout
-            .pages
-            .iter()
-            .filter(|page| page.number == 1 || Some(page.number) == segments.frontmatter.primary())
-        {
+        for page in layout.pages.iter().filter(|page| {
+            !segments
+                .frontmatter
+                .withdrawal_notices
+                .contains(&page.number)
+                && (page.number == 1 || Some(page.number) == segments.frontmatter.primary())
+        }) {
             let mut note = Vec::new();
             for i in page.line_range.clone() {
                 if segments.zones[i] == Zone::Headnote {
@@ -2137,6 +2158,75 @@ mod tests {
             copyright_date(frontmatter.ordered_text()).unwrap().year,
             Some(2001)
         );
+    }
+
+    #[test]
+    fn withdrawal_cover_does_not_supply_replacement_metadata() {
+        for wording in [
+            "The attached publication has been withdrawn.",
+            "This publication has been withdrawn.",
+        ] {
+            let layout = page_layout(&[
+                &[
+                    "Withdrawal notice",
+                    wording,
+                    "It may have been superseded by another publication.",
+                    "DOI: 10.1234/replacement123",
+                    "Copyright 2025",
+                ],
+                &[
+                    "The original report",
+                    "DOI: 10.1234/original123",
+                    "Copyright 2001",
+                ],
+            ]);
+            let frontmatter = Frontmatter::detect(&layout, &[Zone::Header; 8], &Default::default());
+            assert_eq!(frontmatter.primary(), Some(2));
+            assert!(frontmatter.withdrawal_notices.contains(&1));
+            let mut header = Header::default();
+            apply_identifiers(&mut header, &layout, &frontmatter, &[], "");
+            assert_eq!(header.doi.as_deref(), Some("10.1234/original123"));
+            assert_eq!(
+                copyright_date(frontmatter.ordered_text()).unwrap().year,
+                Some(2001)
+            );
+        }
+    }
+
+    #[test]
+    fn recovers_rfc_titles_from_mastheads() {
+        assert_eq!(
+            rfc_frontmatter(
+                "Internet Engineering Task Force\nRFC 9114\nHTTP/3\nAbstract\nDescription\nStatus of this Memo"
+            ),
+            Some(("9114", "HTTP/3".into()))
+        );
+        assert_eq!(
+            rfc_frontmatter(
+                "Network Working Group\nRequest for Comments: 1951   P. Deutsch\nMay 1996\nDEFLATE specification\nStatus of This Memo"
+            ),
+            Some(("1951", "DEFLATE specification".into()))
+        );
+        assert!(
+            rfc_frontmatter(
+                "A Survey\nDOI: 10.1234/survey123\nRFC 9114\nHTTP/3\nStatus of This Memo"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn corroborates_embedded_report_titles_on_the_page() {
+        let page = "NIST Special Publication 800-145\nThe NIST Definition of Cloud\nComputing";
+        assert_eq!(
+            nist_report_title(
+                "NIST SP 800-145, The NIST Definition of Cloud Computing",
+                page
+            )
+            .as_deref(),
+            Some("The NIST Definition of Cloud Computing")
+        );
+        assert!(nist_report_title("A different title", page).is_none());
     }
 
     #[test]
