@@ -248,6 +248,7 @@ pub(super) struct Frontmatter {
     pages: Vec<(usize, String)>,
     pub(super) candidates: Vec<usize>,
     pub(super) excluded: HashSet<usize>,
+    pub(super) withdrawal_notices: HashSet<usize>,
     book: bool,
     pub(super) book_metadata: Option<BookFrontmatter>,
 }
@@ -269,7 +270,13 @@ impl Frontmatter {
                 )
             })
             .collect::<Vec<_>>();
-        let mut excluded = HashSet::new();
+        let withdrawal_notices: HashSet<_> = pages
+            .iter()
+            .take(2)
+            .filter(|(_, text)| withdrawal_notice(text))
+            .map(|(number, _)| *number)
+            .collect();
+        let mut excluded = withdrawal_notices.clone();
         for (number, text) in &pages {
             if text.trim().is_empty()
                 || (*number <= 2 && repository_cover(text))
@@ -281,7 +288,9 @@ impl Frontmatter {
 
         // Sparse half-titles and series leaves precede the title page in books.
         // Require evidence of a book or a richer next page with a repeated title.
-        let book = pages.iter().any(|(_, text)| isbn(text).is_some());
+        let book = pages
+            .iter()
+            .any(|(page, text)| !withdrawal_notices.contains(page) && isbn(text).is_some());
         let book_metadata = book.then(|| detect_book(&pages)).flatten().filter(|book| {
             xmp(layout, "prism:publicationName").is_none()
                 && embedded_dois(layout).filter_map(doi).all(|id| {
@@ -329,6 +338,7 @@ impl Frontmatter {
             pages,
             candidates,
             excluded,
+            withdrawal_notices,
             book,
             book_metadata,
         }
@@ -343,6 +353,22 @@ impl Frontmatter {
             .iter()
             .find(|(number, _)| *number == page)
             .map_or("", |(_, text)| text)
+    }
+
+    pub(super) fn nist_report_pages(&self, doi: &str) -> impl Iterator<Item = &str> {
+        let primary = self.primary().unwrap_or_default();
+        let lead = self.candidates.iter().copied().take(3);
+        let nist = doi.to_ascii_lowercase().starts_with("10.6028/nist.")
+            && lead.clone().any(|page| {
+                page <= primary + 2
+                    && self
+                        .text(page)
+                        .lines()
+                        .take(6)
+                        .any(|line| NIST_MASTHEAD.is_match(line))
+            });
+        lead.filter(move |&page| nist && page <= primary + 2)
+            .map(|page| self.text(page))
     }
 
     pub(super) fn edited_title_page(&self) -> Option<(String, String)> {
@@ -390,10 +416,105 @@ impl Frontmatter {
             .chain(
                 self.pages
                     .iter()
-                    .filter(|(page, _)| Some(*page) != self.primary())
+                    .filter(|(page, _)| {
+                        Some(*page) != self.primary() && !self.withdrawal_notices.contains(page)
+                    })
                     .map(|(_, text)| text.as_str()),
             )
     }
+}
+
+static RFC_HEADING: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?im)^RFC[ \t]+([1-9][0-9]{0,4})[ \t]*$").unwrap());
+static RFC_LEGACY_HEADING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?im)^Request for Comments[ \t]*:[ \t]*([1-9][0-9]{0,4})\b").unwrap()
+});
+static RFC_STATUS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?im)^Status of This Memo[ \t]*$").unwrap());
+static RFC_NUMBER_FIELD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?im)^RFC[ \t]*:\s*([1-9][0-9]{0,4})[ \t]*$").unwrap());
+static MONTH_YEAR_LINE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?im)\b(?:January|February|March|April|May|June|July|August|September|October|November|December) [0-9]{4}[ \t]*$").unwrap()
+});
+
+// Identify the title-page publication number, independently of any cited DOI.
+static NIST_MASTHEAD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?im)^NIST (?:Special Publication|SP|Interagency Report|IR)[ 	]+[0-9]").unwrap()
+});
+static NIST_EMBEDDED_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^NIST (?:Special Publication|SP|Interagency Report|IR) [0-9][a-z0-9.-]*[, :] +",
+    )
+    .unwrap()
+});
+
+pub(super) fn nist_report_title(title: &str, page: &str) -> Option<String> {
+    let title = NIST_EMBEDDED_PREFIX.replace(title, "");
+    let lead = page.lines().take(12).collect::<Vec<_>>().join(" ");
+    let key = |text: &str| {
+        text.chars()
+            .filter(|ch| ch.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let title_key = key(&title);
+    (!title_key.is_empty() && key(&lead).contains(&title_key)).then(|| title.into_owned())
+}
+
+pub(super) fn rfc_frontmatter(text: &str) -> Option<(&str, String)> {
+    let masthead = &text[..RFC_STATUS.find(text)?.start()];
+    let first_line = masthead.lines().next()?.trim();
+    let ietf = first_line.eq_ignore_ascii_case("Internet Engineering Task Force");
+    if let Some(captures) = RFC_HEADING.captures(masthead) {
+        let heading = captures.get(0)?;
+        let number = captures.get(1)?.as_str();
+        let has_catalogue_fields = (first_line.to_ascii_lowercase().starts_with("stream:")
+            || heading.start() == 0)
+            && RFC_NUMBER_FIELD
+                .captures(masthead)
+                .is_some_and(|fields| &fields[1] == number);
+        if !ietf && !has_catalogue_fields {
+            return None;
+        }
+        let title = compact(
+            &masthead[heading.end()..]
+                .trim()
+                .lines()
+                .take_while(|line| !ABSTRACT.is_match(line))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+        return (!title.is_empty()).then_some((number, title));
+    }
+    if !ietf
+        && !first_line
+            .to_ascii_lowercase()
+            .starts_with("network working group")
+    {
+        return None;
+    }
+    let captures = RFC_LEGACY_HEADING.captures(masthead)?;
+    let date = MONTH_YEAR_LINE.find_at(masthead, captures.get(0)?.end())?;
+    let title = compact(&masthead[date.end()..]);
+    (!title.is_empty()).then_some((captures.get(1)?.as_str(), title))
+}
+
+fn withdrawal_notice(text: &str) -> bool {
+    let flat = compact(text).to_ascii_lowercase();
+    text.lines()
+        .map(|line| compact(line).to_ascii_lowercase())
+        .any(|line| {
+            matches!(line.as_str(), "withdrawal notice" | "warning notice")
+                || (line.starts_with("withdrawn ") && line.ends_with(" publication"))
+        })
+        && [
+            "the attached publication has been withdrawn",
+            "this publication has been withdrawn",
+            "the publication has been withdrawn",
+        ]
+        .iter()
+        .any(|phrase| flat.contains(phrase))
+        && flat.contains("superseded by")
 }
 
 pub(super) fn repository_cover(text: &str) -> bool {
@@ -778,6 +899,7 @@ pub(super) fn apply_identifiers(
                     .filter(|page| *page <= 3)
                     .into_iter()
                     .chain(1..=3)
+                    .filter(|page| !frontmatter.withdrawal_notices.contains(page))
                     .find_map(|page| arxiv(frontmatter.text(page)))
             });
         header.pmid = texts().find_map(|text| capture(&PMID, text));
@@ -791,6 +913,7 @@ pub(super) fn apply_identifiers(
         let copyright_pages = frontmatter
             .pages
             .iter()
+            .filter(|(page, _)| !frontmatter.withdrawal_notices.contains(page))
             .map(|(_, text)| text.as_str())
             .filter(|text| COPYRIGHT_YEAR.is_match(text) || non_title_page(text))
             .collect::<Vec<_>>();
@@ -1027,6 +1150,27 @@ pub(super) fn header_publication_date(
                     .as_str();
                 Some(Date {
                     year: year(raw),
+                    raw: raw.to_owned(),
+                    ..Default::default()
+                })
+            })
+    })
+    .or_else(|| {
+        frontmatter
+            .nist_report_pages(header.doi.as_deref()?)
+            .find_map(|text| {
+                let raw = text.lines().take(30).map(str::trim).find(|line| {
+                    MONTH_YEAR_LINE
+                        .find(line)
+                        .is_some_and(|date| date.start() == 0)
+                })?;
+                let (month, raw_year) = raw.split_once(' ')?;
+                Some(Date {
+                    year: Some(year(raw_year)?),
+                    month: month
+                        .parse::<chrono::Month>()
+                        .ok()
+                        .map(|month| month.number_from_month() as u8),
                     raw: raw.to_owned(),
                     ..Default::default()
                 })
