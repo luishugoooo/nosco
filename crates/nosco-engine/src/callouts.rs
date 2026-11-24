@@ -268,6 +268,9 @@ fn resolve_bibr(text: &str, ctx: &ResolveCtx<'_>) -> Option<String> {
         if let Some(id) = ctx.ref_by_label.get(&key) {
             return Some(id.clone());
         }
+        if let Some(id) = ctx.footnote_by_label.get(&key) {
+            return Some(id.clone());
+        }
         if first_num >= 1 && first_num <= ctx.references.len() {
             return ctx.references[first_num - 1].id.clone();
         }

@@ -179,6 +179,9 @@ impl Engine {
         let formula_count = crate::fulltext::formula_count(&document.body);
         document.annexes = self.fulltext(&mut document, layout, &segments.indices(Zone::Annex), &mut scratch, formula_count)?;
         document.footnotes = self.footnotes(&segments);
+        if document.references.is_empty() && !document.footnotes.is_empty() {
+            self.extract_footnote_references(&mut document, &mut scratch)?;
+        }
         let acknowledgement = segments.indices(Zone::Acknowledgements);
         if !acknowledgement.is_empty() {
             document.acknowledgements = Some(render(layout, &acknowledgement, self.lexicon(), false).text);
@@ -249,22 +252,45 @@ impl Engine {
         }
 
         // A recognizable bibliography heading anchors the reference tail even
-        // when the segmentation model only finds the middle of the zone.
+        // when the segmentation model only finds the middle of the zone or
+        // extends an adjacent acknowledgement zone over it.
         if scan_references
             && let Some(heading) = (0..zones.len()).rev().find(|&i| {
-                matches!(zones[i], Zone::References | Zone::Body | Zone::Other)
-                    && REF_HEADING.is_match(line_text(i).trim())
+                matches!(
+                    zones[i],
+                    Zone::References | Zone::Body | Zone::Acknowledgements | Zone::Other
+                ) && REF_HEADING.is_match(line_text(i).trim())
+                    && (layout.pages.len() < 3 || layout.lines[i].page > 1)
             })
         {
+            for (i, zone) in zones.iter_mut().enumerate().take(heading) {
+                if *zone == Zone::References && !furniture[i] && !badge[i] {
+                    *zone = Zone::Body;
+                }
+            }
             for (i, zone) in zones.iter_mut().enumerate().skip(heading + 1) {
-                if *zone == Zone::Annex || (*zone == Zone::Body && BACK_HEADING.is_match(&line_text(i))) {
+                if *zone == Zone::Annex
+                    || (matches!(*zone, Zone::Body | Zone::Other)
+                        && BACK_HEADING.is_match(&line_text(i)))
+                {
                     break;
                 }
-                if matches!(*zone, Zone::Body | Zone::References) {
+                if !furniture[i]
+                    && !badge[i]
+                    && matches!(
+                        *zone,
+                        Zone::Body | Zone::References | Zone::Acknowledgements | Zone::Other
+                    )
+                {
                     *zone = Zone::References;
                 }
             }
             zones[heading] = Zone::Other;
+        } else if scan_references
+            && !zones.iter().any(|&z| z == Zone::References)
+            && zones.iter().filter(|&&z| z == Zone::Footnote).count() < 3
+        {
+            recover_numbered_footnotes(layout, &mut zones, &mut starts, &furniture, &badge, &line_text);
         }
         Ok(Segmented {
             layout,
@@ -660,6 +686,8 @@ impl Engine {
                 }
                 chunk.text.extend_from_slice(line);
             }
+        } else if let Some(indented_chunks) = hanging_indent_chunks(layout, &indices, self.lexicon()) {
+            chunks = indented_chunks;
         } else {
             for span in spans(&labels) {
                 let indices = &input.token_indices[span.rows];
@@ -738,17 +766,387 @@ impl Engine {
             let active = segments.zones[i] == Zone::Footnote
                 && !segments.furniture[i]
                 && !segments.badge[i];
-            if !active || previous_page != Some(line.page) || segments.starts[i] {
+            if !active {
+                push(&mut notes, &mut indices, previous_page);
+                continue;
+            }
+            let page_changed = previous_page.is_some() && previous_page != Some(line.page);
+            if segments.starts[i] || (page_changed && !indices.is_empty() && {
+                let line_indices: Vec<_> = line
+                    .token_range
+                    .clone()
+                    .filter(|&j| layout.tokens.get(j).is_some_and(layout_visible))
+                    .collect();
+                let line_str = render(layout, &line_indices, self.lexicon(), false).text;
+                FOOTNOTE_LABEL.is_match(&line_str)
+            }) {
                 push(&mut notes, &mut indices, previous_page);
             }
-            if active {
-                indices.extend(line.token_range.clone().filter(|&j| layout.tokens.get(j).is_some_and(layout_visible)));
+            indices.extend(line.token_range.clone().filter(|&j| layout.tokens.get(j).is_some_and(layout_visible)));
+            if previous_page.is_none() || segments.starts[i] {
                 previous_page = Some(line.page);
             }
         }
         push(&mut notes, &mut indices, previous_page);
         notes
     }
+
+    fn extract_footnote_references(
+        &self,
+        document: &mut Document,
+        scratch: &mut DecodeScratch,
+    ) -> Result<(), EngineError> {
+        static IBID: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)^(?:ibid|id)\b\.?").unwrap());
+        static SIGNAL: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(
+                r"(?i)^(?:(?:and\s+)?(?:see\s+also|see|cf\.|e\.g\.,?|for\s+[^,]{1,80},?\s+see|cited\s+in|quoted\s+in|on\s+[^,]{1,60},?\s+see)\s+|and\s+)",
+            )
+            .unwrap()
+        });
+        static YEAR: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"\b(?:18|19|20)\d{2}\b").unwrap());
+        static DOI_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?i)(?:doi\.org/|10\.\d{4,9}/)").unwrap());
+
+        let mut parsed_refs: Vec<BibItem> = Vec::new();
+        let mut remaining_footnotes: Vec<Footnote> = Vec::new();
+        let mut previous_primary: Option<BibItem> = None;
+
+        for note in std::mem::take(&mut document.footnotes) {
+            let Some(label) = note.label.as_deref().filter(|l| l.chars().all(|c| c.is_ascii_digit())) else {
+                remaining_footnotes.push(note);
+                continue;
+            };
+            let trimmed = note.text.trim();
+            if IBID.is_match(trimmed)
+                && let Some(prev) = &previous_primary
+            {
+                let mut item = prev.clone();
+                item.id = Some(format!("b{}", parsed_refs.len()));
+                item.label = Some(label.to_owned());
+                item.raw_citation = trimmed.to_owned();
+                parsed_refs.push(item);
+                continue;
+            }
+
+            let clauses = split_footnote_clauses(trimmed);
+            let mut note_refs = Vec::new();
+            for clause in clauses {
+                let stripped = SIGNAL.replace(clause, "").trim().to_owned();
+                if stripped.len() < 12 {
+                    continue;
+                }
+                let has_quote = stripped.contains('“') || stripped.contains('"');
+                let has_year = YEAR.is_match(&stripped);
+                let has_doi = DOI_RE.is_match(&stripped);
+                let short_prior = find_prior_ref_by_title(&stripped, &parsed_refs);
+                if !has_quote && !has_year && !has_doi && short_prior.is_none() {
+                    continue;
+                }
+                if let Some(prior) = short_prior.filter(|_| !has_year && !has_doi) {
+                    let mut item = prior.clone();
+                    item.id = Some(format!("b{}", parsed_refs.len() + note_refs.len()));
+                    item.label = Some(label.to_owned());
+                    item.raw_citation = clause.to_owned();
+                    note_refs.push(item);
+                    continue;
+                }
+                let mut item = self.parse_citation_with(&stripped, scratch)?;
+                let has_structured = item.title.is_some()
+                    || !item.authors.is_empty()
+                    || item.doi.is_some()
+                    || item.journal.is_some();
+                if !has_structured {
+                    continue;
+                }
+                if item.date.is_none()
+                    && item.journal.is_none()
+                    && let Some(title) = item.title.as_deref()
+                    && let Some(prior) = find_prior_ref_by_title(title, &parsed_refs)
+                {
+                    if item.date.is_none() {
+                        item.date = prior.date.clone();
+                    }
+                    if item.journal.is_none() {
+                        item.journal = prior.journal.clone();
+                    }
+                    if item.doi.is_none() {
+                        item.doi = prior.doi.clone();
+                    }
+                    if item.authors.is_empty() {
+                        item.authors = prior.authors.clone();
+                    }
+                }
+                item.id = Some(format!("b{}", parsed_refs.len() + note_refs.len()));
+                item.label = Some(label.to_owned());
+                item.raw_citation = clause.to_owned();
+                note_refs.push(item);
+            }
+
+            if note_refs.is_empty() {
+                remaining_footnotes.push(note);
+            } else {
+                previous_primary = note_refs.first().cloned();
+                parsed_refs.extend(note_refs);
+            }
+        }
+
+        if !parsed_refs.is_empty() {
+            document.references = parsed_refs;
+            document.footnotes = remaining_footnotes;
+        } else {
+            document.footnotes = remaining_footnotes;
+        }
+        Ok(())
+    }
+}
+
+fn hanging_indent_chunks(
+    layout: &LayoutDocument,
+    indices: &[usize],
+    lexicon: &nosco_lexicon::Lexicon,
+) -> Option<Vec<ReferenceChunk>> {
+    // Group reference tokens into visual lines, preserving page & x-coordinate.
+    let mut page_lines: Vec<(usize, Vec<(f64, Vec<usize>)>)> = Vec::new();
+    for line_tokens in indices.chunk_by(|&a, &b| layout.tokens[a].line_idx == layout.tokens[b].line_idx) {
+        let line_idx = layout.tokens[line_tokens[0]].line_idx;
+        let line = &layout.lines[line_idx];
+        let text = render(layout, line_tokens, lexicon, false).text;
+        if text.trim().is_empty() || REF_HEADING.is_match(text.trim()) {
+            continue;
+        }
+        let x = line.bbox.x;
+        if page_lines.last().is_none_or(|(p, _)| *p != line.page) {
+            page_lines.push((line.page, Vec::new()));
+        }
+        page_lines.last_mut().unwrap().1.push((x, line_tokens.to_vec()));
+    }
+
+    let total_lines: usize = page_lines.iter().map(|(_, lines)| lines.len()).sum();
+    if total_lines < 8 {
+        return None;
+    }
+
+    // Check per-page left-margin clustering (handles alternating odd/even journal margins).
+    let mut indented_total = 0usize;
+    let mut margin_total = 0usize;
+    let mut page_bases: Vec<f64> = Vec::with_capacity(page_lines.len());
+    for (_, lines) in &page_lines {
+        let mut xs: Vec<f64> = lines.iter().map(|(x, _)| *x).collect();
+        xs.sort_by(|a, b| a.total_cmp(b));
+        let base_x = xs[xs.len() / 10];
+        // Require a single-column-like layout on each page (indented lines cluster within ~40pt of base_x).
+        let max_indent = xs.iter().copied().fold(0.0f64, |acc, x| acc.max(x - base_x));
+        if max_indent > 60.0 {
+            return None;
+        }
+        for &x in &xs {
+            if x <= base_x + 4.5 {
+                margin_total += 1;
+            } else if x >= base_x + 6.0 {
+                indented_total += 1;
+            }
+        }
+        page_bases.push(base_x);
+    }
+
+    if margin_total < 4 || indented_total < (total_lines * 15 / 100).max(2) {
+        return None;
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = ReferenceChunk::default();
+    for ((_, lines), base_x) in page_lines.into_iter().zip(page_bases) {
+        for (x, tokens) in lines {
+            if x <= base_x + 4.5 {
+                push_chunk(&mut chunks, &mut current);
+            }
+            current.text.extend(tokens);
+        }
+    }
+    push_chunk(&mut chunks, &mut current);
+    (!chunks.is_empty()).then_some(chunks)
+}
+
+fn line_font_size(layout: &LayoutDocument, line_idx: usize) -> f64 {
+    let mut sizes: Vec<f64> = layout.lines[line_idx]
+        .token_range
+        .clone()
+        .filter_map(|j| layout.tokens.get(j))
+        .filter(|t| layout_visible(t) && t.font_size > 0.0)
+        .map(|t| t.font_size)
+        .collect();
+    if sizes.is_empty() {
+        return 0.0;
+    }
+    sizes.sort_by(|a, b| a.total_cmp(b));
+    sizes[sizes.len() / 2]
+}
+
+fn recover_numbered_footnotes(
+    layout: &LayoutDocument,
+    zones: &mut [Zone],
+    starts: &mut [bool],
+    furniture: &[bool],
+    badge: &[bool],
+    line_text: &impl Fn(usize) -> String,
+) {
+    static NUMBERED_NOTE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\s*(\d{1,3})\.\s+\S").unwrap());
+    static FOOTER_NOISE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)^(?:this content downloaded from|all use subject to|downloaded from|https?://about\.jstor\.org|©\s*\d{4}\b|\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\s+on\b)")
+            .unwrap()
+    });
+
+    // Compute dominant body font size from upper-half lines across the document.
+    let mut size_counts: HashMap<u32, usize> = HashMap::new();
+    for (i, line) in layout.lines.iter().enumerate() {
+        if furniture[i] || badge[i] || zones[i] != Zone::Body {
+            continue;
+        }
+        let Some(page) = layout.pages.get(line.page.saturating_sub(1)) else {
+            continue;
+        };
+        if line.bbox.y > page.height * 0.55 {
+            continue;
+        }
+        let text = line_text(i);
+        if text.len() < 30 {
+            continue;
+        }
+        let sz = (line_font_size(layout, i) * 2.0).round() as u32;
+        if sz > 0 {
+            *size_counts.entry(sz).or_default() += 1;
+        }
+    }
+    let body_size = size_counts
+        .into_iter()
+        .max_by_key(|&(_, count)| count)
+        .map_or(10.0, |(bucket, _)| f64::from(bucket) / 2.0);
+    let max_fn_size = body_size * 0.92;
+    let min_fn_size = 5.5;
+
+    let mut last_num = 0u32;
+    let mut recovered_notes = 0usize;
+    let mut candidates: Vec<(usize, bool)> = Vec::new();
+
+    for page in &layout.pages {
+        let mut small_lines: Vec<(usize, String)> = Vec::new();
+        for i in page.line_range.clone() {
+            if furniture[i] || badge[i] {
+                continue;
+            }
+            if !matches!(zones[i], Zone::Body | Zone::Other | Zone::Footnote) {
+                continue;
+            }
+            let line = &layout.lines[i];
+            if line.bbox.y < page.height * 0.28 || line.bbox.y > page.height - 50.0 {
+                continue;
+            }
+            let sz = line_font_size(layout, i);
+            if sz > max_fn_size || sz < min_fn_size {
+                continue;
+            }
+            let text = line_text(i);
+            let trimmed = text.trim();
+            if trimmed.is_empty() || FOOTER_NOISE.is_match(trimmed) {
+                continue;
+            }
+            if sz <= body_size * 0.75 && trimmed.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            small_lines.push((i, trimmed.to_owned()));
+        }
+        if small_lines.is_empty() {
+            continue;
+        }
+
+        let first_note_idx = small_lines.iter().position(|(_, text)| {
+            NUMBERED_NOTE
+                .captures(text)
+                .and_then(|c| c.get(1)?.as_str().parse::<u32>().ok())
+                .is_some_and(|num| num > last_num && num <= last_num + 15)
+        });
+
+        // Lines before the first numbered footnote on this page may continue the previous page's note.
+        if recovered_notes > 0 {
+            let cont_end = first_note_idx.unwrap_or(small_lines.len());
+            if let Some((first_line, first_text)) = small_lines.first()
+                && cont_end > 0
+                && layout.lines[*first_line].bbox.y > page.height * 0.42
+                && first_text.len() >= 15
+            {
+                for &(line_idx, _) in &small_lines[..cont_end] {
+                    candidates.push((line_idx, false));
+                }
+            }
+        }
+
+        let Some(start_idx) = first_note_idx else {
+            continue;
+        };
+        for (line_idx, text) in &small_lines[start_idx..] {
+            if let Some(num) = NUMBERED_NOTE
+                .captures(text)
+                .and_then(|c| c.get(1)?.as_str().parse::<u32>().ok())
+                .filter(|&num| num > last_num && num <= last_num + 15)
+            {
+                last_num = num;
+                recovered_notes += 1;
+                candidates.push((*line_idx, true));
+            } else if recovered_notes > 0 {
+                candidates.push((*line_idx, false));
+            }
+        }
+    }
+
+    if recovered_notes >= 3 {
+        for (line_idx, is_start) in candidates {
+            zones[line_idx] = Zone::Footnote;
+            starts[line_idx] = is_start;
+        }
+    }
+}
+
+fn split_footnote_clauses(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut start = 0usize;
+    for (idx, ch) in text.char_indices() {
+        match ch {
+            '“' | '"' => in_quote = !in_quote,
+            '”' => in_quote = false,
+            '(' | '[' if !in_quote => depth += 1,
+            ')' | ']' if !in_quote => depth = depth.saturating_sub(1),
+            ';' if !in_quote && depth == 0 => {
+                let chunk = text[start..idx].trim();
+                if !chunk.is_empty() {
+                    parts.push(chunk);
+                }
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    parts
+}
+
+fn find_prior_ref_by_title<'a>(text: &str, prior: &'a [BibItem]) -> Option<&'a BibItem> {
+    let lower = text.to_lowercase();
+    prior.iter().find(|item| {
+        let Some(title) = item.title.as_deref() else {
+            return false;
+        };
+        let title_lower = title.to_lowercase();
+        let prefix: String = title_lower.chars().take(24).collect();
+        prefix.len() >= 10 && lower.contains(&prefix)
+    })
 }
 
 fn strip_crossmark(text: &str) -> String {
