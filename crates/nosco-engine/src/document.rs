@@ -18,19 +18,35 @@ use rayon::prelude::*;
 use regex::Regex;
 
 use crate::identifiers::*;
+use crate::metadata::repair_metadata_text;
 use crate::spans::{append, base, bboxes, clean, compact, layout_visible, new_line, render, spans};
 use crate::text::{markers, set_affiliation_keys};
 use crate::{Engine, EngineError, ModelKind};
 
-static ABSTRACT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*abstract\b[\s.:—–-]*").unwrap());
-static KEYWORDS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*(?:key\s*words?|index terms)\b[\s.:—–-]*").unwrap());
-static FIRST_SECTION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(?:(?:1\.?|I\.)\s+)?(?:introduction|contents|background)\s*$").unwrap());
-static REF_HEADING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(?:[\d.]+\s+)?(?:references|bibliography|literature cited|works cited|references and notes)\s*[.:]?$").unwrap());
-static BACK_HEADING: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(?:appendix|annex|supplementary (?:material|information))\b").unwrap());
-static REF_LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\[\s*\d{1,5}\s*\]|\(\s*\d{1,5}\s*\)|\d{1,5}[.)])(?:\s|$)").unwrap());
-static INLINE_LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\[\s*\d{1,5}\s*\]|\(\s*\d{1,5}\s*\)|\d{1,5}[.)])").unwrap());
-static FOOTNOTE_LABEL: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*(\d+|[*†‡])(?:\s+|[.)]\s*)").unwrap());
-static CROSSMARK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bcheck\s+for\s+updates\b").unwrap());
+static ABSTRACT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*abstract\b[\s.:—–-]*").unwrap());
+static KEYWORDS: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^\s*(?:key\s*words?|index terms)\b[\s.:—–-]*").unwrap());
+static FIRST_SECTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:(?:1\.?|I\.)\s+)?(?:introduction|contents|background)\s*$").unwrap()
+});
+static REF_HEADING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:[\d.]+\s+)?(?:references|bibliography|literature cited|works cited|references and notes)\s*[.:]?$").unwrap()
+});
+static BACK_HEADING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:appendix|annex|supplementary (?:material|information))\b").unwrap()
+});
+static CODE_REF_LABEL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(\[\s*[A-Z]+[0-9]+\s*\])\s*").unwrap());
+static REF_LABEL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(\[\s*\d{1,5}\s*\]|\(\s*\d{1,5}\s*\)|\d{1,5}[.)])(?:\s|$)").unwrap()
+});
+static INLINE_LABEL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(\[\s*\d{1,5}\s*\]|\(\s*\d{1,5}\s*\)|\d{1,5}[.)])").unwrap());
+static FOOTNOTE_LABEL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(\d+|[*†‡])(?:\s+|[.)]\s*)").unwrap());
+static CROSSMARK: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bcheck\s+for\s+updates\b").unwrap());
 
 const HEADER_OPTIONS: ExtractOptions = ExtractOptions { max_pages: Some(8) };
 const HEADER_TOKEN_LIMIT: usize = 2500;
@@ -142,7 +158,10 @@ impl Segmented<'_> {
 
 impl Engine {
     pub fn process_pdf_file(&self, path: &Path) -> Result<Document, EngineError> {
-        self.process_layout(&extract_from_file(path)?)
+        self.process_layout_with_stem(
+            &extract_from_file(path)?,
+            path.file_stem().and_then(|stem| stem.to_str()),
+        )
     }
 
     pub fn process_pdf_bytes(&self, bytes: &[u8]) -> Result<Document, EngineError> {
@@ -150,7 +169,10 @@ impl Engine {
     }
 
     pub fn process_header_file(&self, path: &Path) -> Result<Header, EngineError> {
-        self.process_header_layout(&extract_from_file_with_options(path, HEADER_OPTIONS)?)
+        self.process_header_layout_with_stem(
+            &extract_from_file_with_options(path, HEADER_OPTIONS)?,
+            path.file_stem().and_then(|stem| stem.to_str()),
+        )
     }
 
     pub fn process_header_bytes(&self, bytes: &[u8]) -> Result<Header, EngineError> {
@@ -170,9 +192,17 @@ impl Engine {
     }
 
     pub fn process_layout(&self, layout: &LayoutDocument) -> Result<Document, EngineError> {
+        self.process_layout_with_stem(layout, None)
+    }
+
+    fn process_layout_with_stem(
+        &self,
+        layout: &LayoutDocument,
+        file_stem: Option<&str>,
+    ) -> Result<Document, EngineError> {
         let mut scratch = DecodeScratch::new();
         let segments = self.segment(layout, &mut scratch, true)?;
-        let header = self.header(&segments, &mut scratch)?;
+        let header = self.header(&segments, file_stem, &mut scratch)?;
         let references = self.references(&segments, &mut scratch)?;
         let mut document = Document { header, references, page_count: layout.pages.len(), ..Default::default() };
         document.body = self.fulltext(&mut document, layout, &segments.indices(Zone::Body), &mut scratch, 0)?;
@@ -191,9 +221,17 @@ impl Engine {
     }
 
     pub fn process_header_layout(&self, layout: &LayoutDocument) -> Result<Header, EngineError> {
+        self.process_header_layout_with_stem(layout, None)
+    }
+
+    fn process_header_layout_with_stem(
+        &self,
+        layout: &LayoutDocument,
+        file_stem: Option<&str>,
+    ) -> Result<Header, EngineError> {
         let mut scratch = DecodeScratch::new();
         let segments = self.segment(layout, &mut scratch, false)?;
-        self.header(&segments, &mut scratch)
+        self.header(&segments, file_stem, &mut scratch)
     }
 
     pub fn process_references_layout(&self, layout: &LayoutDocument) -> Result<Vec<BibItem>, EngineError> {
@@ -303,7 +341,12 @@ impl Engine {
         })
     }
 
-    fn header(&self, segments: &Segmented<'_>, scratch: &mut DecodeScratch) -> Result<Header, EngineError> {
+    fn header(
+        &self,
+        segments: &Segmented<'_>,
+        file_stem: Option<&str>,
+        scratch: &mut DecodeScratch,
+    ) -> Result<Header, EngineError> {
         let layout = segments.layout;
         let indices = segments.header_indices();
         let labels = self.tag(
@@ -349,7 +392,10 @@ impl Engine {
             }
             match span.tag {
                 "<title>" => {
-                    let stripped = strip_crossmark(value);
+                    let selected_title = title_tokens(layout, selected);
+                    let title_text = (selected_title.len() != selected.len())
+                        .then(|| render(layout, selected_title, self.lexicon(), false).text);
+                    let stripped = strip_crossmark(title_text.as_deref().unwrap_or(value));
                     let cleaned = clean_title(&stripped);
                     let page = layout.tokens[selected[0]].page;
                     if title_page.is_none_or(|first| first == page)
@@ -446,33 +492,110 @@ impl Engine {
                 .iter()
                 .filter_map(|number| layout.pages.iter().find(|page| page.number == *number))
         };
-        header.title = header
-            .title
-            .filter(|title| plausible_title(title))
-            .or_else(|| {
-                candidate_pages().find_map(|page| {
-                    recover_title_from_page(layout, segments, page, self.lexicon())
-                        .filter(|title| plausible_title(title))
+        let repair = |text| repair_metadata_text(text, self.lexicon());
+        let embedded = [layout.metadata.title.as_deref(), xmp(layout, "dc:title")];
+        let title_ok = |title: &String| {
+            plausible_title(title) && !repeated_title(title) && !unresolved_tracked_title(title)
+        };
+        let embedded_titles = || {
+            embedded
+                .into_iter()
+                .flatten()
+                .map(compact)
+                .map(repair)
+                .map(|title| clean_title(&title).to_owned())
+                .filter(|title| {
+                    usable_embedded_title(title)
+                        && !repeated_title(title)
+                        && file_stem.is_none_or(|stem| !stem.eq_ignore_ascii_case(title))
                 })
-            })
-            .or_else(|| {
-                [xmp(layout, "dc:title"), layout.metadata.title.as_deref()]
-                    .into_iter()
-                    .flatten()
-                    .map(compact)
-                    .map(|title| clean_title(&title).to_owned())
-                    .find(|title| plausible_title(title))
-            });
-        if let Some((title, editor_line)) = frontmatter.edited_title_page() {
-            let lower_title = title.to_lowercase();
-            if header
+        };
+        let page_title = |page| {
+            recover_title_from_page(layout, segments, page, self.lexicon())
+                .map(repair)
+                .filter(title_ok)
+        };
+        let title_candidates = || candidate_pages().filter_map(page_title);
+        if let Some(book) = &frontmatter.book_metadata {
+            let recovered = || {
+                layout
+                    .pages
+                    .iter()
+                    .filter(|page| page.number == book.half_title_page)
+                    .filter_map(page_title)
+                    .chain(
+                        candidate_pages()
+                            .filter(|page| page.number < book.copyright_page)
+                            .filter_map(page_title),
+                    )
+                    .find(|title| !frontmatter.is_book_series_title(title))
+            };
+            header.title = header
                 .title
-                .as_ref()
-                .is_none_or(|value| lower_title.contains(&value.to_lowercase()))
-            {
-                header.title = Some(title);
+                .take()
+                .map(repair)
+                .filter(title_ok)
+                .filter(|title| !frontmatter.is_book_series_title(title))
+                .map(|title| {
+                    if let Some(lead) = recovered()
+                        && let Some(rest) = title
+                            .strip_prefix(&lead)
+                            .and_then(|rest| rest.strip_suffix(&lead))
+                        && !rest.trim().is_empty()
+                    {
+                        format!("{lead}: {}", rest.trim())
+                    } else {
+                        title
+                    }
+                })
+                .or_else(|| {
+                    let cover = repair(book.title.clone());
+                    if book.names.as_ref().is_some_and(|(_, editor)| *editor) {
+                        // The title was isolated from an explicit contributor block or
+                        // repeated on a separate title page with an editor credit.
+                        return Some(cover);
+                    }
+                    recovered()
+                        .or_else(|| embedded_titles().next())
+                        .or(Some(cover))
+                });
+            if let Some((names, editor)) = &book.names {
+                let people = self.parse_names(names, ModelKind::NameHeader, scratch)?;
+                if !people.is_empty() {
+                    header.authors.clear();
+                    author_positions.clear();
+                    if *editor {
+                        header.editors = people;
+                    } else if header.editors.is_empty() {
+                        header.authors = people;
+                    }
+                }
             }
-            let editor_keys = email_key(editor_line);
+        } else {
+            header.title = header
+                .title
+                .take()
+                .map(repair)
+                .map(|title| {
+                    if let Some(value) = embedded.into_iter().flatten().find(|value| {
+                        usable_embedded_title(value) && repairs_uppercase_spacing(&title, value)
+                    }) {
+                        repair(compact(value))
+                    } else {
+                        restore_tracked_title(title, |word| self.lexicon().in_dictionary(word))
+                    }
+                })
+                .filter(title_ok)
+                .or_else(|| title_candidates().next())
+                .or_else(|| embedded_titles().next());
+        }
+        if frontmatter.book_metadata.is_none()
+            && let Some((title, editor_line)) = frontmatter.edited_title_page()
+        {
+            if header.title.is_none() {
+                header.title = Some(repair(title));
+            }
+            let editor_keys = email_key(&editor_line);
             let mut index = 0;
             while index < header.authors.len() {
                 let key = email_key(&header.authors[index].full_name());
@@ -483,19 +606,9 @@ impl Engine {
                 }
             }
             if header.editors.is_empty() {
-                header.editors = self.parse_names(editor_line, ModelKind::NameHeader, scratch)?;
+                header.editors = self.parse_names(&editor_line, ModelKind::NameHeader, scratch)?;
             }
         }
-        header.title = header.title.map(|title| {
-            let embedded = xmp(layout, "dc:title").or(layout.metadata.title.as_deref());
-            if let Some(embedded) =
-                embedded.filter(|embedded| repairs_uppercase_spacing(&title, embedded))
-            {
-                compact(embedded)
-            } else {
-                restore_tracked_title(title, |word| self.lexicon().in_dictionary(word))
-            }
-        });
         if header.abstract_text.is_none()
             && !header
                 .title
@@ -544,6 +657,13 @@ impl Engine {
         }
         dedup_authors(&mut header.authors);
         dedup_authors(&mut header.editors);
+        if frontmatter.book_metadata.is_some() {
+            for contributors in [&mut header.authors, &mut header.editors] {
+                if contributors.len() > 15 {
+                    contributors.clear();
+                }
+            }
+        }
         let mut links = layout
             .links
             .iter()
@@ -552,10 +672,23 @@ impl Engine {
             .collect::<Vec<_>>();
         links.sort_by_key(|link| (Some(link.page) != frontmatter.primary(), link.page));
         apply_identifiers(&mut header, layout, frontmatter, &links, &raw.text);
-        self.parse_header_venue(segments, &mut header, venue_spans, scratch)?;
-        header.meeting = header.meeting.take().filter(|text| plausible_venue(text));
+        if frontmatter.book_metadata.is_none() {
+            self.parse_header_venue(segments, &mut header, venue_spans, scratch)?;
+        }
         apply_xmp_imprint(&mut header, layout);
-        header.journal = header.journal.take().filter(|text| plausible_venue(text));
+        if frontmatter.book_metadata.is_some() {
+            header.meeting = None;
+            header.journal = None;
+            header.volume = None;
+            header.issue = None;
+        } else {
+            for venue in [&mut header.meeting, &mut header.journal] {
+                *venue = venue
+                    .take()
+                    .map(repair)
+                    .filter(|text| plausible_venue(text));
+            }
+        }
         for email in emails(&raw.text)
             .into_iter()
             .chain(emails_from_links(&links))
@@ -577,8 +710,16 @@ impl Engine {
             let text = render(layout, &funding, self.lexicon(), false).text;
             append(&mut header.funding_note, &text);
         }
-        header.publication_date =
-            header_publication_date(&header, layout, frontmatter, date_candidates);
+        if let Some(book) = &frontmatter.book_metadata {
+            header.dates.clear();
+            header.publication_date = book
+                .date
+                .clone()
+                .or_else(|| embedded_date(layout, &["prism:publicationDate", "dc:date"]));
+        } else {
+            header.publication_date =
+                header_publication_date(&header, layout, frontmatter, date_candidates);
+        }
         set_affiliation_keys(&mut header.affiliations);
         link_affiliations(&mut header.authors, &header.affiliations);
         link_affiliations(&mut header.editors, &header.affiliations);
@@ -719,30 +860,40 @@ impl Engine {
                 }
             }
         }
-        let citations: Vec<_> = chunks.into_par_iter().map_init(DecodeScratch::new, |scratch, chunk| {
-            let mut text = render(layout, &chunk.text, self.lexicon(), false).text;
-            let mut label = (!chunk.label.is_empty()).then(|| render(layout, &chunk.label, self.lexicon(), false).text);
-            if label.is_none()
-                && parse_ref_label_num(&text).is_some()
-                && let Some(parts) = INLINE_LABEL.captures(&text)
-            {
-                label = parts.get(1).map(|label| label.as_str().to_owned());
-                text = text[parts.get(0).unwrap().end()..].trim_start().to_owned();
-            }
-            if text.trim().is_empty() || REF_HEADING.is_match(text.trim()) {
-                return Ok(None);
-            }
-            let mut item = self.parse_citation_with(&text, scratch)?;
-            item.label = label.filter(|label| !label.trim().is_empty());
-            let mut indices = chunk.label;
-            indices.extend(chunk.text);
-            item.bboxes = bboxes(layout, &indices);
-            Ok(Some(item))
-        }).collect::<Result<_, EngineError>>()?;
-        Ok(citations.into_iter().flatten().enumerate().map(|(index, mut item)| {
-            item.id = Some(format!("b{index}"));
-            item
-        }).collect())
+        let citations: Vec<_> = chunks
+            .into_par_iter()
+            .map_init(DecodeScratch::new, |scratch, chunk| {
+                let mut text = render(layout, &chunk.text, self.lexicon(), false).text;
+                let mut label = (!chunk.label.is_empty())
+                    .then(|| render(layout, &chunk.label, self.lexicon(), false).text);
+                if label.is_none()
+                    && let Some(parts) = CODE_REF_LABEL.captures(&text).or_else(|| {
+                        parse_ref_label_num(&text).and_then(|_| INLINE_LABEL.captures(&text))
+                    })
+                {
+                    label = parts.get(1).map(|label| label.as_str().to_owned());
+                    text = text[parts.get(0).unwrap().end()..].trim_start().to_owned();
+                }
+                if text.trim().is_empty() || REF_HEADING.is_match(text.trim()) {
+                    return Ok(None);
+                }
+                let mut item = self.parse_citation_with(&text, scratch)?;
+                item.label = label.filter(|label| !label.trim().is_empty());
+                let mut indices = chunk.label;
+                indices.extend(chunk.text);
+                item.bboxes = bboxes(layout, &indices);
+                Ok(Some(item))
+            })
+            .collect::<Result<_, EngineError>>()?;
+        Ok(citations
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(index, mut item)| {
+                item.id = Some(format!("b{index}"));
+                item
+            })
+            .collect())
     }
 
     fn footnotes(&self, segments: &Segmented<'_>) -> Vec<Footnote> {
@@ -1447,6 +1598,55 @@ fn recover_end_of_paper_authors(
     (!rendered.trim().is_empty()).then_some(rendered)
 }
 
+fn title_tokens<'a>(layout: &LayoutDocument, mut indices: &'a [usize]) -> &'a [usize] {
+    while let Some((&last, rest)) = indices.split_last() {
+        let token = &layout.tokens[last];
+        if !matches!(token.text.as_str(), "†" | "‡" | "*")
+            && !(token.superscript && token.text == "q")
+        {
+            break;
+        }
+        indices = rest;
+    }
+    indices
+}
+
+fn small_caps_title(
+    layout: &LayoutDocument,
+    indices: &[usize],
+    lexicon: &nosco_lexicon::Lexicon,
+) -> Option<(String, f64)> {
+    let mut words = String::new();
+    let mut largest: f64 = 0.0;
+    let mut joined = 0;
+    let mut tokens = indices.iter().map(|&idx| &layout.tokens[idx]).peekable();
+    while let Some(token) = tokens.next() {
+        if !token.text.bytes().all(|byte| byte.is_ascii_uppercase()) {
+            return None;
+        }
+        if !words.is_empty() {
+            words.push(' ');
+        }
+        let start = words.len();
+        words.push_str(&token.text);
+        if let Some(next) = tokens.peek()
+            && token.text.len() == 1
+            && next.font_size < token.font_size * 0.85
+            && next.text.bytes().all(|byte| byte.is_ascii_uppercase())
+        {
+            words.push_str(&next.text);
+            if lexicon.in_dictionary(&words[start..]) {
+                largest = largest.max(token.font_size);
+                joined += 1;
+                tokens.next();
+            } else {
+                words.truncate(start + token.text.len());
+            }
+        }
+    }
+    (joined >= 2).then_some((words, largest))
+}
+
 fn recover_title_from_page(
     layout: &LayoutDocument,
     segments: &Segmented<'_>,
@@ -1456,7 +1656,7 @@ fn recover_title_from_page(
     let dominant = layout.dominant_font_size().max(9.0);
     let mut candidates: Vec<(usize, f64, String)> = Vec::new();
     for i in page.line_range.clone() {
-        if segments.furniture[i] || segments.badge[i] {
+        if segments.badge[i] {
             continue;
         }
         let line = &layout.lines[i];
@@ -1476,7 +1676,24 @@ fn recover_title_from_page(
         if toks.is_empty() {
             continue;
         }
-        let text = compact(&render(layout, &toks, lexicon, false).text);
+        let toks = title_tokens(layout, &toks);
+        if toks.is_empty() {
+            continue;
+        }
+        let small_caps = small_caps_title(layout, toks, lexicon);
+        // Some journals repeat the title in their running headers. A prominent
+        // small-caps title on the title page can share the same furniture key.
+        if segments.furniture[i]
+            && !small_caps
+                .as_ref()
+                .is_some_and(|(_, size)| *size >= dominant * 1.4)
+        {
+            continue;
+        }
+        let text = small_caps.as_ref().map_or_else(
+            || compact(&render(layout, toks, lexicon, false).text),
+            |(text, _)| text.clone(),
+        );
         let trimmed = text.trim();
         if trimmed.is_empty() {
             continue;
@@ -1498,10 +1715,10 @@ fn recover_title_from_page(
         }
         let mut sizes: Vec<f64> = toks.iter().map(|&j| layout.tokens[j].font_size).collect();
         sizes.sort_unstable_by(f64::total_cmp);
-        let median_size = sizes[sizes.len() / 2];
+        let size = small_caps.map_or(sizes[sizes.len() / 2], |(_, size)| size);
         let title = clean_title(trimmed);
         if plausible_title(title) {
-            candidates.push((i, median_size, title.to_owned()));
+            candidates.push((i, size, title.to_owned()));
         }
     }
     let max_size = candidates
@@ -2199,6 +2416,71 @@ mod tests {
         assert_eq!(year("2099"), None);
         assert_eq!(arxiv_date("hep-th/9901001").unwrap().year, Some(1999));
         assert_eq!(arxiv_date("2301.12345").unwrap().month, Some(1));
+    }
+
+    #[test]
+    fn recovers_a_large_title_before_embedded_metadata() {
+        let Some(models) = std::env::var_os("NOSCO_MODELS") else {
+            return;
+        };
+        let engine = Engine::load_for_header(Path::new(&models)).unwrap();
+        let mut layout = page_layout(&[&[
+            "The work of science",
+            "A longer contextual line in a much smaller font",
+        ]]);
+        layout.tokens[0].font_size = 22.0;
+        layout.metadata.title = Some("An unrelated publication title".into());
+        let header = engine.process_header_layout(&layout).unwrap();
+        assert_eq!(header.title.as_deref(), Some("The work of science"));
+    }
+
+    #[test]
+    fn assembles_book_and_fallback_titles_with_header_models() {
+        let Some(models) = std::env::var_os("NOSCO_MODELS") else {
+            return;
+        };
+        let engine = Engine::load_for_header(Path::new(&models)).unwrap();
+        let mut layout = page_layout(&[
+            &["A History of Science", "Written by Ada Lovelace"],
+            &[
+                "Copyright 2021",
+                "ISBN 978-0-387-32458-6",
+                "ISSN 2413-1954",
+                "References",
+                "doi: 10.1234/chapter",
+            ],
+        ]);
+        layout.metadata.doi = Some("10.1007/978-0-387-32458-6".into());
+        let header = engine.process_header_layout(&layout).unwrap();
+        assert_eq!(header.title.as_deref(), Some("A History of Science"));
+        assert_eq!(header.authors[0].last_name.as_deref(), Some("Lovelace"));
+        assert_eq!(header.isbn.as_deref(), Some("9780387324586"));
+        assert_eq!(header.publication_date.unwrap().year, Some(2021));
+        assert_eq!(header.doi.as_deref(), Some("10.1007/978-0-387-32458-6"));
+        assert_eq!(header.issn.as_deref(), Some("2413-1954"));
+
+        layout.metadata.doi = Some("10.1234/article1".into());
+        let header = engine.process_header_layout(&layout).unwrap();
+        assert_eq!(header.doi.as_deref(), Some("10.1234/article1"));
+        assert!(header.journal.is_none());
+        assert!(header.meeting.is_none());
+
+        let mut layout = page_layout(&[&["This page intentionally left blank"]]);
+        layout.metadata.title = Some("DISCUSSION PAPER SERIES New findings".into());
+        let header = engine.process_header_layout(&layout).unwrap();
+        assert_eq!(header.title.as_deref(), Some("New findings"));
+
+        for names in [
+            engine.parse_header_names("Ada¹ Lovelace†").unwrap(),
+            engine.parse_citation_names("Lovelace†, A.").unwrap(),
+        ] {
+            assert!(!names.is_empty());
+            assert!(
+                names
+                    .iter()
+                    .all(|person| !person.full_name().contains(['¹', '†']))
+            );
+        }
     }
 
     #[test]

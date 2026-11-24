@@ -5,6 +5,7 @@ mod callouts;
 mod document;
 mod fulltext;
 mod identifiers;
+mod metadata;
 mod spans;
 mod text;
 

@@ -1,3 +1,4 @@
+use crate::metadata::{year_mentions, year_suffix};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -183,12 +184,22 @@ fn resolve_sections(sections: &mut [Section], ctx: &ResolveCtx<'_>) {
             if let BodyElement::Paragraph(paragraph) = elem {
                 let mut expanded = Vec::with_capacity(paragraph.callouts.len());
                 for mut callout in std::mem::take(&mut paragraph.callouts) {
-                    // Reclassify author-year citations mis-tagged as Formula markers.
-                    if callout.kind == CalloutKind::Formula
-                        && extract_year(&callout.text).is_some()
-                        && callout.text.chars().any(char::is_alphabetic)
-                    {
-                        callout.kind = CalloutKind::Bibr;
+                    // The model can mistake author-year and bracketed code citations for formulas.
+                    if callout.kind == CalloutKind::Formula {
+                        let text = callout.text.trim();
+                        let code_label = text
+                            .strip_prefix('[')
+                            .and_then(|text| text.strip_suffix(']'))
+                            .is_some_and(|key| {
+                                is_citation_code(key.trim())
+                                    && ctx.ref_by_label.contains_key(&normalize_label(text))
+                            });
+                        if code_label
+                            || (extract_year(text).is_some()
+                                && text.chars().any(char::is_alphabetic))
+                        {
+                            callout.kind = CalloutKind::Bibr;
+                        }
                     }
                     if callout.kind == CalloutKind::Bibr {
                         let pieces = split_bibliography_callout(&callout);
@@ -277,11 +288,19 @@ fn resolve_bibr(text: &str, ctx: &ResolveCtx<'_>) -> Option<String> {
     }
 
     // Author-year matching: e.g. "(Smith et al., 2020a)" or "Wang (2008)".
-    let year = extract_year(text);
+    let (year, suffix) = year_mentions(text)
+        .next()
+        .map_or((None, None), |(year, suffix)| (Some(year), suffix));
     let words: Vec<String> = text
-        .split(|c: char| !c.is_alphabetic())
-        .filter(|w| w.len() >= 2)
-        .map(fold_surname)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| word.len() >= 2 && word.contains(char::is_alphabetic))
+        .map(|word| {
+            if is_citation_code(word) {
+                word.to_ascii_lowercase()
+            } else {
+                fold_surname(word)
+            }
+        })
         .filter(|w| {
             !matches!(
                 w.as_str(),
@@ -294,7 +313,7 @@ fn resolve_bibr(text: &str, ctx: &ResolveCtx<'_>) -> Option<String> {
         return None;
     }
 
-    let mut best: Option<(usize, &str)> = None;
+    let mut best: Option<((bool, usize), &str)> = None;
     let mut tied = false;
     for bib in ctx.references {
         let Some(id) = bib.id.as_deref() else {
@@ -321,15 +340,31 @@ fn resolve_bibr(text: &str, ctx: &ResolveCtx<'_>) -> Option<String> {
         if !any_author_match {
             continue;
         }
+        let suffix_match = if let Some(suffix) = suffix {
+            let bib_suffix = bib
+                .date
+                .as_ref()
+                .and_then(|date| year_suffix(&date.raw, year))
+                .or_else(|| year_suffix(&bib.raw_citation, year));
+            if bib_suffix.is_some_and(|bib_suffix| bib_suffix != suffix) {
+                continue;
+            }
+            bib_suffix == Some(suffix)
+        } else {
+            false
+        };
         let second_author_bonus = usize::from(
             first_author_match
                 && bib.authors.get(1).and_then(|a| a.last_name.as_deref()).is_some_and(|last| {
                     surname_matches(last, &words)
                 }),
         );
-        let score = (if first_author_match { 3 } else { 1 })
-            + 2 * usize::from(year_match)
-            + second_author_bonus;
+        let score = (
+            suffix_match,
+            (if first_author_match { 3 } else { 1 })
+                + 2 * usize::from(year_match)
+                + second_author_bonus,
+        );
         match best {
             None => {
                 best = Some((score, id));
@@ -352,7 +387,19 @@ fn resolve_bibr(text: &str, ctx: &ResolveCtx<'_>) -> Option<String> {
     }
 }
 
+fn is_citation_code(text: &str) -> bool {
+    let stem = text.trim_end_matches(|ch: char| ch.is_ascii_digit());
+    stem.len() < text.len()
+        && !stem.is_empty()
+        && stem.bytes().all(|byte| byte.is_ascii_uppercase())
+}
+
 fn surname_matches(raw_last: &str, callout_words: &[String]) -> bool {
+    if is_citation_code(raw_last) {
+        return callout_words
+            .iter()
+            .any(|word| word.eq_ignore_ascii_case(raw_last));
+    }
     let folded = fold_surname(raw_last);
     if folded.len() >= 2 && callout_words.iter().any(|w| w == &folded) {
         return true;
@@ -388,6 +435,7 @@ fn fold_surname(s: &str) -> String {
 fn normalize_label(raw: &str) -> String {
     raw.trim()
         .trim_matches(|c: char| matches!(c, '[' | ']' | '(' | ')' | '.' | ',' | ':' | ';' | ' '))
+        .trim()
         .to_lowercase()
 }
 
@@ -409,9 +457,7 @@ fn extract_first_bib_number(text: &str) -> Option<usize> {
 }
 
 fn extract_year(text: &str) -> Option<i32> {
-    static YEAR_RE: OnceLock<Regex> = OnceLock::new();
-    let re = YEAR_RE.get_or_init(|| Regex::new(r"\b((?:18|19|20)\d{2})[a-z]?\b").expect("valid regex"));
-    re.captures(text)?.get(1)?.as_str().parse().ok()
+    year_mentions(text).next().map(|(year, _)| year)
 }
 
 fn extract_number_or_roman(text: &str) -> Option<String> {
@@ -443,6 +489,84 @@ fn extract_number_or_roman(text: &str) -> Option<String> {
 mod tests {
     use super::*;
     use nosco_models::{Date, Figure, Paragraph, Person, Table};
+
+    #[test]
+    fn matches_citation_codes_without_discarding_digits() {
+        assert!(is_citation_code("CW1"));
+        assert!(surname_matches("CW1", &["cw1".into()]));
+        assert!(surname_matches("REN21", &["ren21".into()]));
+        assert!(!surname_matches("CW1", &["cw2".into()]));
+        assert!(!surname_matches("R2", &["r".into()]));
+
+        let mut doc = Document {
+            references: vec![BibItem {
+                id: Some("code".into()),
+                label: Some("[CW1]".into()),
+                ..Default::default()
+            }],
+            body: vec![Section {
+                elements: vec![BodyElement::Paragraph(Paragraph {
+                    text: "[CW1]".into(),
+                    callouts: vec![Callout {
+                        kind: CalloutKind::Formula,
+                        text: "[CW1]".into(),
+                        target_id: None,
+                        char_start: 0,
+                        char_end: 5,
+                    }],
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        resolve(&mut doc);
+        let BodyElement::Paragraph(paragraph) = &doc.body[0].elements[0] else {
+            panic!("expected a paragraph");
+        };
+        let callout = &paragraph.callouts[0];
+        assert_eq!(callout.kind, CalloutKind::Bibr);
+        assert_eq!(callout.target_id.as_deref(), Some("code"));
+    }
+
+    #[test]
+    fn resolves_year_suffixes_from_dates_and_raw_citations() {
+        let reference = |id: &str, raw: &str, citation: &str| BibItem {
+            id: Some(id.into()),
+            authors: vec![Person {
+                last_name: Some("Shen".into()),
+                ..Default::default()
+            }],
+            date: Some(Date {
+                year: Some(2023),
+                raw: raw.into(),
+                ..Default::default()
+            }),
+            raw_citation: citation.into(),
+            ..Default::default()
+        };
+        let refs = [
+            reference("a", "2023a", ""),
+            reference("b", "2023", "Shen (2023b). A study."),
+        ];
+        let ctx = ResolveCtx {
+            references: &refs,
+            ref_by_label: HashMap::new(),
+            fig_by_label: HashMap::new(),
+            fig_ids: vec![],
+            tab_by_label: HashMap::new(),
+            tab_ids: vec![],
+            formula_by_label: HashMap::new(),
+            footnote_by_label: HashMap::new(),
+        };
+        assert_eq!(
+            resolve_bibr("Shen et al., 2023B", &ctx).as_deref(),
+            Some("b")
+        );
+        assert_eq!(resolve_bibr("Shen (2023a)", &ctx).as_deref(), Some("a"));
+        assert_eq!(resolve_bibr("Shen (2023c)", &ctx), None);
+        assert_eq!(resolve_bibr("Shen (2023)", &ctx), None);
+    }
 
     #[test]
     fn resolves_numeric_and_author_year_and_figure_table_callouts() {

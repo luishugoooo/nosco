@@ -9,6 +9,10 @@ use nosco_lexicon::tokenizer::{tokenize, tokenize_spans, tokenize_with_spaces};
 use nosco_models::{Affiliation, BibItem, Date, Person};
 
 use crate::identifiers::*;
+use crate::metadata::{
+    clean_citation_title, clean_name_field, is_affiliation_symbol, recover_code_citation,
+    repair_metadata_text,
+};
 use crate::spans::{append, clean, compact, spans};
 use crate::{Engine, EngineError, ModelKind};
 
@@ -140,6 +144,9 @@ pub(crate) fn joins_split_ligature(
         .split(|c: char| !c.is_alphabetic())
         .next()
         .unwrap_or("");
+    if left_word.eq_ignore_ascii_case("wifi") || left_word.eq_ignore_ascii_case("hifi") {
+        return false;
+    }
     right_word.starts_with(char::is_lowercase)
         && left_word
             .strip_suffix("fi")
@@ -228,6 +235,12 @@ impl Engine {
             start = matched.end();
         }
         self.name_list(&text[start..], kind, scratch, &mut people)?;
+        for person in &mut people {
+            clean_name_field(&mut person.first_name);
+            clean_name_field(&mut person.middle_name);
+            clean_name_field(&mut person.last_name);
+        }
+        people.retain(has_name);
         Ok(people)
     }
 
@@ -283,7 +296,7 @@ impl Engine {
             }
             let at = offsets[span.rows.start].start;
             let marker = span.tag == "<marker>"
-                || (kind == ModelKind::NameHeader && value.chars().all(is_marker_symbol));
+                || (kind == ModelKind::NameHeader && value.chars().all(is_affiliation_symbol));
             if marker {
                 person.affiliation_markers.extend(markers(value));
                 person.corresp |= value.contains('*');
@@ -361,7 +374,7 @@ impl Engine {
             let newline = text[previous_end..range.start].contains('\n');
             let explicit_marker = AFFILIATION_LINE_MARKER.captures(raw)
                 .is_some_and(|c| clean(c.get(0).unwrap().as_str()) == clean(raw))
-                || (raw.chars().all(is_marker_symbol) && newline);
+                || (raw.chars().all(is_affiliation_symbol) && newline);
             let new_group = match span.tag {
                 "<institution>" => !affiliation.institutions.is_empty(),
                 "<department>" => !affiliation.departments.is_empty(),
@@ -467,10 +480,29 @@ impl Engine {
             item.editors = self.parse_names(&editors, ModelKind::NameCitation, scratch)?;
         }
         if let Some(date) = date {
-            item.date = self.parse_date_with(&date, scratch)?.into_iter().next().or_else(|| {
-                let value = YEAR.find(&date)?.as_str();
-                Some(Date { year: year(value), raw: date, ..Default::default() })
-            });
+            item.date = self
+                .parse_date_with(&date, scratch)?
+                .into_iter()
+                .next()
+                .or_else(|| {
+                    let value = YEAR.find(&date)?.as_str();
+                    Some(Date {
+                        year: year(value),
+                        raw: date,
+                        ..Default::default()
+                    })
+                });
+        }
+        item.title = item
+            .title
+            .take()
+            .map(|title| repair_metadata_text(title, self.lexicon()));
+        clean_citation_title(&mut item);
+        recover_code_citation(&mut item);
+        for venue in [&mut item.journal, &mut item.book_title, &mut item.series] {
+            *venue = venue
+                .take()
+                .map(|text| repair_metadata_text(text, self.lexicon()));
         }
         if let Some(parts) = item.page_range.as_deref().and_then(|pages| PAGES.captures(pages)) {
             item.first_page = Some(parts[1].to_owned());
@@ -627,10 +659,6 @@ pub(crate) fn set_affiliation_keys(affiliations: &mut [Affiliation]) {
     }
 }
 
-fn is_marker_symbol(c: char) -> bool {
-    "⁰¹²³⁴⁵⁶⁷⁸⁹*†‡§".contains(c)
-}
-
 pub(crate) fn markers(text: &str) -> Vec<String> {
     let mut result = Vec::new();
     let mut current = String::new();
@@ -643,8 +671,12 @@ pub(crate) fn markers(text: &str) -> Vec<String> {
             if !current.is_empty() {
                 result.push(std::mem::take(&mut current));
             }
-            if is_marker_symbol(ch) || ch == '∗' {
-                result.push(if ch == '∗' { "*".into() } else { ch.to_string() });
+            if is_affiliation_symbol(ch) {
+                result.push(if ch == '∗' {
+                    "*".into()
+                } else {
+                    ch.to_string()
+                });
             }
         }
     }
