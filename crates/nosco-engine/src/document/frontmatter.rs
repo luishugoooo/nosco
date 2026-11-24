@@ -966,6 +966,18 @@ pub(super) fn apply_identifiers(
     }
 }
 
+// Report identifiers and total page counts are not journal pagination.
+static NIST_REPORT_IMPRINT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b\d{2,5}\s*[-–]\s*\d{1,5}[a-z]?(?:\s*[-–]\s*[a-z0-9]+)*\s*,?\s+\d+\s+pages\b[,.]?",
+    )
+    .unwrap()
+});
+
+pub(super) fn nist_report_venue(text: &str) -> std::borrow::Cow<'_, str> {
+    NIST_REPORT_IMPRINT.replace_all(text, "")
+}
+
 pub(super) fn apply_venue(header: &mut Header, item: BibItem) {
     header.journal = header
         .journal

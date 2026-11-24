@@ -787,10 +787,19 @@ impl Engine {
                 spans.push(render(layout, &note, self.lexicon(), false).text);
             }
         }
+        let is_nist_report = header
+            .doi
+            .as_deref()
+            .is_some_and(|doi| segments.frontmatter.nist_report_pages(doi).next().is_some());
         for venue in spans.iter().filter(|text| {
             (8..=600).contains(&text.chars().count()) && !boilerplate(text) && plausible_venue(text)
         }) {
-            apply_venue(header, self.parse_citation_with(venue, scratch)?);
+            let text = if is_nist_report {
+                nist_report_venue(venue)
+            } else {
+                std::borrow::Cow::Borrowed(venue.as_str())
+            };
+            apply_venue(header, self.parse_citation_with(&text, scratch)?);
         }
         Ok(())
     }
@@ -2633,6 +2642,23 @@ mod tests {
         assert_eq!(header.volume.as_deref(), Some("15"));
         assert_eq!(header.pages.as_deref(), Some("1234"));
         assert!(header.note.is_none());
+    }
+
+    #[test]
+    fn strips_report_numbers_and_total_page_counts_from_nist_imprints() {
+        for imprint in [
+            "800-63B, 79 pages",
+            "800-63C, 49 pages",
+            "800-63-3, 74 pages",
+        ] {
+            let citation = format!("Natl. Inst. Stand. Technol. Spec. Publ. {imprint} (June 2017)");
+            assert_eq!(
+                nist_report_venue(&citation),
+                "Natl. Inst. Stand. Technol. Spec. Publ.  (June 2017)"
+            );
+        }
+        let journal = "Journal of Biological Chemistry, Vol. 295, No. 20, pp. 6501–6509";
+        assert_eq!(nist_report_venue(journal), journal);
     }
 
     #[test]
